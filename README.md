@@ -1,4 +1,4 @@
-# IBDBoost
+# IBD-Booster
 
 #### to start, run the pipeline.sh script
 
