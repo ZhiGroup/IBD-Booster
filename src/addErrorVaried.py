@@ -1,9 +1,16 @@
 import random
 from collections import defaultdict
+from typing import List
 
+"""
+This file contains a modified version of the error_imputer class that allows the user to add varied error
+i.e. each individual gets different amounts of error
+to use this, one needs to input a list containing the desired error rates, and these rates will be randomly chosen for each
+individual and applied
+"""
 
 class error_imputer:
-    def __init__(self, input_fp, error_rates, output_fp):
+    def __init__(self, input_fp: str, error_rates: List[float], output_fp: str) -> None:
         self.input_fp = input_fp
         self.error_rates = error_rates
         self.output_fp = output_fp
@@ -29,7 +36,7 @@ class error_imputer:
         else:
             return "0"
 
-    def add_error(self):
+    def add_error(self) -> None:
         for i in range(0, len(self.vcf_data[0])):
             seed_val = ((43 * i) * 11) // 7
             random.seed(seed_val)
@@ -46,7 +53,7 @@ class error_imputer:
                     vals[1] = self.flip_allele(vals[1])
                 self.vcf_data[j][i] = f"{vals[0]}|{vals[1]}"
     
-    def write_to_file(self):
+    def write_to_file(self) -> None:
         f = open(self.output_fp, 'w+')
         for line in self.header_info:
             f.write(line)

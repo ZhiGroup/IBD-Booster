@@ -4,6 +4,10 @@ import tskit
 import sys
 import time
 
+"""
+this file contains functionality for the extraction of ground truth segments from a tree sequence
+"""
+
 ts_path = sys.argv[1]
 start_index = int(sys.argv[2])
 end_index = int(sys.argv[3])

@@ -1,10 +1,11 @@
 import sys
-from typing import List, Dict
+from typing import List, Dict, Tuple
 import os
 import csv
 from tqdm import tqdm
 import numpy as np
 from convertHapMapToPLINK import convert
+
 
 def loadVCFData(vcf_file_path: str):
     """loads in the vcf data into a matrix, creates a dictionary mapping the sample ID to the corresponding index in the vcf, and the list of variable sites
@@ -29,6 +30,10 @@ def loadVCFData(vcf_file_path: str):
 
 
 class Segment:
+    """
+    different from the IBDSegment class in the calculateStatistics.py file (could merge the two for clarity, but they serve two different functions)
+
+    """
     # class to represent segment with some methods to help with splitting by site
     def __init__(self, indiv1: str, hap1:int , indiv2: str, hap2: int, start: int, end: int):
         self.indiv1 = indiv1
@@ -86,8 +91,8 @@ def processSegment(input_string: str) -> Segment:
     tsk_id2 = "tsk_" + str(hap_id2 // 2)
     return Segment(tsk_id1, haplotype1, tsk_id2, haplotype2, start, end)
 
-def generateSegmentChunks(seg: Segment, n_chunks: int, vcf: List[List], sites: List[int], offset: int):
-    """_summary_
+def generateSegmentChunks(seg: Segment, n_chunks: int, vcf: List[List], sites: List[int], offset: int) -> List[Tuple[int, int]]:
+    """ Generates {n_chunks} windows for the segments to be used to create features for the dataset
 
     Args:
         seg (Segment): segment object
@@ -108,7 +113,10 @@ def generateSegmentChunks(seg: Segment, n_chunks: int, vcf: List[List], sites: L
     exclusive_chunk_intervals.append((starts[-1], min(n_sites + offset, sites[-1] - 1)))
     return exclusive_chunk_intervals
 
-def getMismatches(segment: Segment, vcf_data: List[List], site_interval: "tuple[int]", ids_dict: Dict):
+def getMismatches(segment: Segment, vcf_data: List[List], site_interval: Tuple[int], ids_dict: Dict) -> int:
+    """
+    calculates the number of mismatches (where the alleles of an individual don't match for a given segment)
+    """
     n_mismatches = 0
     sample_idx1 = ids_dict[segment.indiv1]
     sample_idx2 = ids_dict[segment.indiv2]
@@ -119,7 +127,11 @@ def getMismatches(segment: Segment, vcf_data: List[List], site_interval: "tuple[
             n_mismatches += 1
     return n_mismatches
 
-def getCorrections(segment: Segment, vcf_data_unsmooth: List[List], vcf_data_smooth: List[List], site_interval: "tuple[int]", ids_dict: Dict):
+def getCorrections(segment: Segment, vcf_data_unsmooth: List[List], vcf_data_smooth: List[List], 
+                   site_interval: Tuple[int], ids_dict: Dict) -> int:
+    """
+    calculates the number of corrections made by P-smoother for a given segment
+    """
     n_corrections = 0
     sample_idx1 = ids_dict[segment.indiv1]
     sample_idx2 = ids_dict[segment.indiv2]
@@ -134,7 +146,14 @@ def getCorrections(segment: Segment, vcf_data_unsmooth: List[List], vcf_data_smo
             n_corrections += 1
     return n_corrections
 
-def generateFeatureNames(n_chunks):
+def generateFeatureNames(n_chunks: int) -> List[str]:
+    """
+    generates feature names for the dataset
+    these include the individual ID and the haplotype index for each individual and the start and end in base pairs for the segment
+
+    then, for however many chunks there are in the segment, feature names for the physical length, genetic length, number of mismatches,
+    and the number of corrections made by P-smoother are added to the list 
+    """
     f_names = ["id1", "hap1", "id2", "hap2", "start", "end"]
     for i in range(n_chunks):
         f_names.append(f"phys_len_{i}")
@@ -144,10 +163,16 @@ def generateFeatureNames(n_chunks):
     f_names.append("classification")
     return f_names
 
-def getGeneticPostion(site, rate_map_dict):
+def getGeneticPostion(site: int, rate_map_dict: Dict):
+    """
+    given a dictionary containing the conversion from base pairs to centimorgans and a base pair site, returns the corresponding genetic location
+    """
     return rate_map_dict[site]
 
-def createRateMapDict(rate_map_fp):
+def createRateMapDict(rate_map_fp: str):
+    """
+    creates hashmap that maps physical location to genetic location
+    """
     f = open(rate_map_fp)
     data = f.readlines()
     f.close()
@@ -158,6 +183,9 @@ def createRateMapDict(rate_map_fp):
     return rate_map_dict
 
 def interpolate_plink_rate_map(vcf_file, plink_rate_map_file):
+        """
+        interpolates the rate map for the case where sites don't line up with the physical locations given by the rate map
+        """
         _started = False
         f = open(vcf_file)
         sites = []
@@ -193,7 +221,10 @@ def interpolate_plink_rate_map(vcf_file, plink_rate_map_file):
         f_o.close()
         return output_file
 
-def checkRateMapType(file_path):
+def checkRateMapType(file_path: str) -> str:
+    """
+    checks whether the rate map is PLINK style or HapMapII style
+    """
     f = open(file_path)
     first = f.readline().strip().split("\t")
     f.close()
@@ -203,14 +234,14 @@ def checkRateMapType(file_path):
         return "PLINK"
 
 def main():
-    vcf_fp = sys.argv[1]
-    vcf_smooth_fp = sys.argv[2]
-    gt_segments_fp = sys.argv[3]
-    true_reported_segments_fp = sys.argv[4]
-    false_reported_segments_fp = sys.argv[5]
-    n_chunks = int(sys.argv[6])
-    rate_map_file = sys.argv[7]
-    output_file = sys.argv[8]
+    vcf_fp = sys.argv[1] # file path to vcf (before correction with P-smoother)
+    vcf_smooth_fp = sys.argv[2] # file path to smoothed VCF
+    gt_segments_fp = sys.argv[3] # file path to ground truth segments
+    true_reported_segments_fp = sys.argv[4] # file path to segments that have more than 50% overlap with a ground truth segment
+    false_reported_segments_fp = sys.argv[5] # file path to segments that have less than 50% overlap with a ground truth segment
+    n_chunks = int(sys.argv[6]) # number of windows to split the reported segment into
+    rate_map_file = sys.argv[7] # path to rate map file
+    output_file = sys.argv[8] # desired output file path
 
 
     rate_map_is_plink = True
@@ -228,7 +259,7 @@ def main():
     with open(output_file, "w+", newline = "\n") as csvfile:
         writer = csv.writer(csvfile)
         writer.writerow(field_names)
-        f = open(gt_segments_fp)
+        f = open(gt_segments_fp) # can probably remove this section, but won't for now (ground truth segments are not included in the analysis at this point)
         for line in tqdm(f.readlines()):
             seg = processSegment(line)
             segment_sites = seg.getAllSegmentSites(vcf_s, sites)
@@ -265,9 +296,9 @@ def main():
             seg_intervals = generateSegmentChunks(seg, n_chunks, vcf_s, sites, offset)
             data = [seg.indiv1, seg.hap1, seg.indiv2, seg.hap2, seg.start, seg.end]
             for interval in seg_intervals:
-                if interval[0] == interval[1]:
+                if interval[0] == interval[1]:  # check for empty interval, should only happen at the end of a segment if the number of sites is divisible by n_chunks - 1 
                     for i in range(4):
-                        data.append(0)
+                        data.append(0) # add zeros for dataset consistency
                     continue
                 physical_start = int(vcf[interval[0]][1])
                 physical_end = int(vcf[interval[1]][1])

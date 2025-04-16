@@ -1,6 +1,9 @@
 import os
 
-def convert(hap_map_file):
+def convert(hap_map_file: str) -> str:
+    """
+    converts a HapMapII styel rate map to a PLINK style rate map
+    """
     f_in = open(hap_map_file)
     split = os.path.splitext(hap_map_file)
     fp_out = split[0] + "_converted" + split[1]

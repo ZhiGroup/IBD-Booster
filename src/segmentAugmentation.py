@@ -4,10 +4,18 @@ import torch.nn as nn
 import xgboost as xgb
 import pandas as pd
 from sklearn.preprocessing import StandardScaler
+from typing import Tuple
+
+# this file is used for the filtering of reported segments using the two machine learning models trained for the task
+# ex: python segmentAugmentation.py {dataset}
+# the input dataset should be that created by constructDataset.py
 
 
 
 class Net(nn.Module):
+    """
+    Neural Network for filtering of segments
+    """
     def __init__(self):
         super(Net, self).__init__()
         self.hidden_layer1 = nn.Linear(40, 36)
@@ -29,8 +37,12 @@ class Net(nn.Module):
         return x
 
 
-def augmentSegments(df):
-    X, y = process_df(df)
+def augmentSegments(df: pd.DataFrame):
+    """
+    this function loads in the the neural network and XGBoost models, then filters them according to the
+    predictions made by each model, returning the original dataframe with 2 new columns (1 for each prediction)
+    """
+    X, _ = process_df(df)
     model = Net()
     model.load_state_dict(torch.load("../models/nn_model_state_dict.model", weights_only=True))
 
@@ -48,7 +60,10 @@ def augmentSegments(df):
     return df
 
 
-def process_df(df):
+def process_df(df: pd.DataFrame) -> Tuple[pd.Dataframe, pd.DataFrame]: 
+    """
+    simple processing of the input file: removal of non-feature columns and ground truth segments (if included)
+    """
     exclude = ["id1", "hap1", "id2", "hap2", "start", "end", "classification", "hap_idx1", "hap_idx2"]
     df = df[df.classification != 1]
     df['classification'] = df['classification'] - 2
@@ -58,7 +73,10 @@ def process_df(df):
     X = pd.DataFrame(scaler.fit_transform(X), columns = X.columns)
     return X, y
 
-def df_to_file(df, output_file, col):
+def df_to_file(df: pd.DateOffset, output_file: str, col: str) -> None:
+    """
+    writes df to a file for downstream use
+    """
     f = open(output_file, 'w')
     for i in range(len(df)):
         row = df.iloc[i]
@@ -68,8 +86,8 @@ def df_to_file(df, output_file, col):
             f.write(f"{row['id1']}\t{row['hap1'] + 1}\t{row['id2']}\t{row['hap2'] + 1}\t20\t{row['start']}\t{row['end']}\t{cm_len}\n")
     f.close()
 
-def main():
-    dataset = sys.argv[1]
+def main() -> None:
+    dataset = sys.argv[1] # the input dataset should be that created by constructDataset.py
     augmented_df = augmentSegments(dataset)
     df_to_file(augmented_df, "predicted_segments_nn.txt", 'nn_pred')
     df_to_file(augmented_df, "predicted_segments_xgb.txt", "xgb_pred")

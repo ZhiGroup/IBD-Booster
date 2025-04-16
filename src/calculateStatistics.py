@@ -1,37 +1,42 @@
 import sys
 import statistics
 import subprocess
-from filterSegments import *
-from formatSegments import *
+from filterSegments import filter_gt, filter_hap
+from formatSegments import formatSegments
+from typing import List
+
 
 class IBDSegment():
+    """
+    this class allows for the quick calculation of statistics about a set of reported IBD segments
+    """
     
-    def __init__(self,_index1,_index2,_start,_end):
+    def __init__(self, _index1: int, _index2: int, _start: int, _end: int) -> None:
         self.index1= _index1
         self.index2 = _index2
         self.start = _start
         self.end = _end
         self.interval = [self.start, self.end]
     
-    def __lt__(self,other):
+    def __lt__(self, other: 'IBDSegment') -> bool:
         if (self.index1 < other.index1): return True
         if (self.index1 == other.index1):
             if (self.index2 < other.index2): return True
         return False
     
-    def __gt__(self,other):
+    def __gt__(self, other: 'IBDSegment') -> bool:
         if (self.index1 > other.index1): return True
         if (self.index1 == other.index1):
             if self.index2 > other.index2: return True
         return False
     
-    def __le__ (self,other):
+    def __le__ (self, other: 'IBDSegment') -> bool:
         if (self.index1 < other.index1): return True
         if (self.index1 == other.index1):
             return self.index2 <= other.index2
         return False
     
-    def __eq__(self,other):
+    def __eq__(self, other: 'IBDSegment') -> bool:
         if (self is None and other is None): return True
         if (other is None): return False
         if (self.index1 == other.index1 and self.index2 == other.index2):
@@ -46,6 +51,9 @@ class IBDSegment():
     
 
 def strToIBDObj(_str):
+    """ 
+    this converts a string of the format hap1\thap2\tstart\tend to an IBDSegment object
+    """
     _index1 = -1
     _index2 = -1
     _start = -1
@@ -63,13 +71,16 @@ def strToIBDObj(_str):
 
 
 
-def get_coverage(_target, _query):
+def get_coverage(_target: List[int, int], _query: List[int, int]) -> float:
     '''
     Returns the proportion of the covered _target interval by the _query
     '''
     return float (max(0, min(_target[1], _query[1]) - max(_target[0], _query[0])))/ ((_query[1]-_query[0]))
 
-def merge_intervals(intervals):
+def merge_intervals(intervals: List[List[int]]) -> List[List[int]]:
+    """
+    merges a list of intervals stored as lists of two integers
+    """
     if len(intervals) <= 1:
         return intervals
     merged =[]
@@ -80,8 +91,10 @@ def merge_intervals(intervals):
                 merged[-1][-1] = max(merged[-1][-1], i[-1])
     return merged
 
-def compute_length_accuracy(gt_path, rp_path):
+def compute_length_accuracy(gt_path: str, rp_path: str) -> float:
     """
+    given a path to ground truth segments and reported segmets, computes the length accuracy of the reported set of segments
+
     assumes the reported segments and ground truth segments are sorted in order their ids
     reports average best coverage by a ground truth segment the reported segments
     """
@@ -119,7 +132,13 @@ def compute_length_accuracy(gt_path, rp_path):
     return statistics.mean(coverage_array) # return average best coverage
 
 
-def compute_accuracy(gt_path,rp_path):
+def compute_accuracy(gt_path: str, rp_path: str) -> float:
+    """
+    given a path to ground truth segments and reported segmets, computes the accuracy of the reported set of segments
+
+    assumes the reported segments and ground truth segments are sorted in order their ids
+    reports average best coverage by a ground truth segment the reported segments
+    """
     
     f_r = open (rp_path)
     f_gt = open(gt_path)
@@ -127,14 +146,16 @@ def compute_accuracy(gt_path,rp_path):
     line_g = f_gt.readline()
     ra_obj = strToIBDObj(line_r)
     gt_obj = strToIBDObj(line_g)
-    num_covered = 0.0
+    num_covered = 0.0 # counts the number of reported segments covered by a ground truth segment (covered defined as greater than 50% coverage)
     num_not_covered = 0
     _ibd_r = []
     #print "start"
     num_v = 0.0
     
-    
+    # iterates through reported segments
     while ra_obj.index1 != -1:    
+        
+        # iterates through gt segments
         while(gt_obj < ra_obj and gt_obj.index1 != -1):
             r = f_gt.readline()
             gt_obj = strToIBDObj(r)
@@ -166,7 +187,7 @@ def compute_accuracy(gt_path,rp_path):
     return num_covered/num_v
 
 
-def compute_power(gt_path,rp_path):
+def compute_power(gt_path: str, rp_path: str) -> float:
     
     f_g = open (gt_path)
     f_r = open(rp_path)
@@ -208,7 +229,7 @@ def compute_power(gt_path,rp_path):
 
     return total_sum/num_v
 
-def compute_accumulative_power(gt_path, rp_path):
+def compute_accumulative_power(gt_path: str, rp_path: str) -> float:
     f_g = open (gt_path)
     f_r = open(rp_path)
     line_g = f_g.readline()
@@ -254,7 +275,7 @@ def compute_accumulative_power(gt_path, rp_path):
 def main():
     hap_output = sys.argv[1]
     gt_file = sys.argv[2]
-    cm_cutoff = float(sys.argv[3])
+    cm_cutoff = float(sys.argv[3]) # cutoff for the minimum length in centimorgans that you want to include in the analysis
     filter_gt(gt_file, "tmp1_gt", cm_cutoff) # filter according to cutoff
     filter_hap(hap_output, "tmp1_hap", cm_cutoff) # filter according to cutoff
     formatSegments("tmp1_hap", "tmp1_gt", "tmp2_hap", "tmp2_gt") # put segments in form samp1 samp2 start end

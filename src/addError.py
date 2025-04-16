@@ -1,9 +1,15 @@
 from collections import defaultdict
 import random
+from typing import List
+
 
 
 class error_imputer:
-    def __init__(self, input_fp, error_rate, output_fp):
+    """
+    this class is used to add error to a VCF file. The given input error rate is applied to each individual in the panel.
+
+    """
+    def __init__(self, input_fp: str, error_rate: float, output_fp: str) -> None:
         self.input_fp = input_fp
         self.error_rate = error_rate
         self.output_fp = output_fp
@@ -23,16 +29,19 @@ class error_imputer:
         self.error_loci = defaultdict()
         self.individuals = self.header_info[-1].split("\t")
     
-    def flip_allele(self, allele):
+    def flip_allele(self, allele: str) -> str:
+        """
+        flips the input allele from a 0 to a 1 or a 1 to a 0
+        """
         if allele == "0":
             return "1"
         else:
             return "0"
 
-    def add_error(self):
-        for i in range(0, len(self.vcf_data[0])):
-            seed_val = ((43 * i) * 11) // 7
-            random.seed(seed_val)
+    def add_error(self) -> None:
+        for i in range(0, len(self.vcf_data[0])): # iterate through the individuals in the panel
+            seed_val = ((43 * i) * 11) // 7 # create seed value
+            random.seed(seed_val) # set seed 
             n_sites_flipped = int(self.n_sites * self.error_rate)
             sites_to_flip = random.sample(range(self.n_sites), n_sites_flipped)
             self.error_loci[self.individuals[i + 9]] = sites_to_flip # added 9 bc I do not get rid of metadata titles in individuals
@@ -45,7 +54,10 @@ class error_imputer:
                     vals[1] = self.flip_allele(vals[1])
                 self.vcf_data[j][i] = f"{vals[0]}|{vals[1]}"
     
-    def write_to_file(self):
+    def write_to_file(self) -> None:
+        """
+        writes new VCF with error to a file
+        """
         f = open(self.output_fp, 'w+')
         for line in self.header_info:
             f.write(line)
@@ -65,7 +77,7 @@ class error_imputer:
 
     
 
-def implant_error(vcf_filepath: str, error_rate: float, output_file: str):
-    obj = error_imputer(vcf_filepath, error_rate, output_file)
+def implant_error(vcf_filepath: str, error_rate: float, output_file: str) -> None:
+    obj = error_imputer(vcf_filepath, error_rate, output_file) # create error_imputer object
     obj.add_error()
     obj.write_to_file()
