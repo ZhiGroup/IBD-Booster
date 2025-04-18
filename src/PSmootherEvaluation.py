@@ -1,5 +1,6 @@
 import sys
 from tqdm import tqdm
+from typing import List, Dict
 
 def loadVCFData(vcf_file_path: str):
 
@@ -17,7 +18,18 @@ def loadVCFData(vcf_file_path: str):
 
 
 
-def getGenotype(vcf, individual, ids_dict, site_idx):
+def getGenotype(vcf: List[List], individual: int, ids_dict: Dict, site_idx: int):
+    """this function fetches the allele for a given individual
+
+    Args:
+        vcf (List[List]): List of lists containing VCF data
+        individual (int): individual index
+        ids_dict (Dict): dictionary mapping individual to index in VCF
+        site_idx (int): index of given site in VCF
+
+    Returns:
+        _type_: _description_
+    """
     site_offset = 1
     indiv_idx = ids_dict[f"tsk_{individual}"]
     if site_idx - 1 > len(vcf):
@@ -28,7 +40,17 @@ def getGenotype(vcf, individual, ids_dict, site_idx):
 # need to account for: correction and correct correction, correction and incorrect correction,
 # no correction and correct no correction, no correction and incorrect no correction
 
-def getCorrectCorrections(original_vcf, vcf_w_error, vcf_w_error_smooth):
+def getCorrectCorrections(original_vcf: List[List], vcf_w_error: List[List], vcf_w_error_smooth: List[List]):
+    """This function is not used in the pipeline, but was used to check how many of P-smoother's corrections were actually correct
+
+    Args:
+        original_vcf (List[List]): Original VCF
+        vcf_w_error (List[List]): Original VCF with error added
+        vcf_w_error_smooth (List[List]): Smoothed version of VCF with error
+
+    Returns:
+        _type_: _description_
+    """
     corrections = 0
     non_corrections = 0
     errors = 0

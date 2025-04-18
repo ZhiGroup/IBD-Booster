@@ -1,6 +1,14 @@
-def formatSegments(hap_ibd_res, gt_file, output_hap, output_gt):
+def formatSegments(hap_ibd_res_fp: str, gt_file: str, output_hap: str, output_gt: str) -> None:
+	"""This function condenses the ground truth segments and the hap-IBD reported segments to the same format
 
-	f = open(hap_ibd_res)
+	Args:
+		hap_ibd_res_fp (str): file path to input hap-IBD results
+		gt_file (str): file path to input ground truth segment results
+		output_hap (str): desired output path for hap-IBD results
+		output_gt (str): desired output path for ground truth segments
+	"""
+
+	f = open(hap_ibd_res_fp)
 	f_o = open(output_hap ,'w+')
 	for line in f:
 		vals = line.split()

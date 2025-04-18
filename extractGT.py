@@ -24,7 +24,7 @@ def main():
     ts = tskit.load(ts_path)
     n_samples = ts.num_samples
     indices = generate_chunks(n_cpus, n_samples)
-    f = open("gt_extraction.sh", "w+")
+    f = open("gt_extraction.sh", "w+") # create script used to splitting ground truth extraction over multiple CPUs
     for i in range(len(indices)):
         string = f"nohup python src/extractTrueIBDs.py {ts_path} {indices[i][0]} {indices[i][1]} {genetic_map_file} {min_cutoff} &\n"
         f.write(string)

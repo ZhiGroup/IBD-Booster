@@ -10,7 +10,10 @@ from PSmootherEvaluation import *
 
 
 class hap_ibd:
-    def __init__(self, path_to_jar, min_seed = 2.0, max_gap = 1000, min_extend = 1.0, min_output = 2.0, min_markers = 100, min_mac = 2, nthreads = 12, exclude_samples = None):
+    """
+    This class is used to call hap-IBD by calling command line commands via the subprocess 
+    """
+    def __init__(self, path_to_jar: str, min_seed = 2.0, max_gap = 1000, min_extend = 1.0, min_output = 2.0, min_markers = 100, min_mac = 2, nthreads = 12, exclude_samples = None):
         self.path_to_jar = path_to_jar
 
         self.min_seed = min_seed
