@@ -232,18 +232,12 @@ def checkRateMapType(file_path: str) -> str:
         return "HapMap"
     else:
         return "PLINK"
+    
 
-def main():
-    vcf_fp = sys.argv[1] # file path to vcf (before correction with P-smoother)
-    vcf_smooth_fp = sys.argv[2] # file path to smoothed VCF
-    gt_segments_fp = sys.argv[3] # file path to ground truth segments
-    true_reported_segments_fp = sys.argv[4] # file path to segments that have more than 50% overlap with a ground truth segment
-    false_reported_segments_fp = sys.argv[5] # file path to segments that have less than 50% overlap with a ground truth segment
-    n_chunks = int(sys.argv[6]) # number of windows to split the reported segment into
-    rate_map_file = sys.argv[7] # path to rate map file
-    output_file = sys.argv[8] # desired output file path
-
-
+def constructDataset(vcf_fp: str, vcf_smooth_fp: str, true_reported_segments_fp: str, false_reported_segments_fp: str, n_chunks: int, rate_map_file: str, output_file: str):
+    """
+    constructs the dataset for the given vcf file
+    """
     rate_map_is_plink = True
     if checkRateMapType(rate_map_file) == "HapMap":
         rate_map_is_plink = False
@@ -251,41 +245,10 @@ def main():
         rate_map_file = convert(rate_map_file)
     rate_map_file = interpolate_plink_rate_map(vcf_fp, rate_map_file)
     rate_map_dict = createRateMapDict(rate_map_file)
-    
-    
     vcf, ids_dict, sites = loadVCFData(vcf_fp)
     vcf_s, _, _ = loadVCFData(vcf_smooth_fp)
     field_names = generateFeatureNames(n_chunks)
     with open(output_file, "w+", newline = "\n") as csvfile:
-        writer = csv.writer(csvfile)
-        writer.writerow(field_names)
-        f = open(gt_segments_fp) # can probably remove this section, but won't for now (ground truth segments are not included in the analysis at this point)
-        for line in tqdm(f.readlines()):
-            seg = processSegment(line)
-            segment_sites = seg.getAllSegmentSites(vcf_s, sites)
-            offset = list(segment_sites.keys())[0]
-            seg_intervals = generateSegmentChunks(seg, n_chunks, vcf_s, sites, offset)
-            data = [seg.indiv1, seg.hap1, seg.indiv2, seg.hap2, seg.start, seg.end]
-            
-            for interval in seg_intervals:
-                if interval[0] == interval[1]: # check for empty interval, should only happen at the end of a segment if the number of sites is divisible by n_chunks - 1 
-                    for i in range(4):
-                        data.append(0)
-                    continue
-                physical_start = int(vcf[interval[0]][1])
-                physical_end = int(vcf[interval[1]][1])
-                genetic_start = getGeneticPostion(interval[0], rate_map_dict)
-                genetic_end = getGeneticPostion(interval[1] - 1, rate_map_dict)
-                physical_length = physical_end - physical_start
-                genetic_length = genetic_end - genetic_start
-                n_mismatches = getMismatches(seg, vcf_s, interval, ids_dict)
-                n_corrections = getCorrections(seg, vcf, vcf_s, interval, ids_dict)
-                data.append(physical_length)
-                data.append(genetic_length)
-                data.append(n_mismatches)
-                data.append(n_corrections)
-            data.append(1)
-            writer.writerow(data)
             
         f.close()
         f = open(true_reported_segments_fp)
@@ -342,6 +305,19 @@ def main():
             data.append(3)
             writer.writerow(data)
         f.close()
+    
+
+def main():
+    vcf_fp = sys.argv[1] # file path to vcf (before correction with P-smoother)
+    vcf_smooth_fp = sys.argv[2] # file path to smoothed VCF
+    gt_segments_fp = sys.argv[3] # file path to ground truth segments
+    true_reported_segments_fp = sys.argv[4] # file path to segments that have more than 50% overlap with a ground truth segment
+    false_reported_segments_fp = sys.argv[5] # file path to segments that have less than 50% overlap with a ground truth segment
+    n_chunks = int(sys.argv[6]) # number of windows to split the reported segment into
+    rate_map_file = sys.argv[7] # path to rate map file
+    output_file = sys.argv[8] # desired output file path
+
+    constructDataset(vcf_fp, vcf_smooth_fp, gt_segments_fp, true_reported_segments_fp, false_reported_segments_fp, n_chunks, rate_map_file, output_file)
 
 if __name__ == "__main__":
     main()
