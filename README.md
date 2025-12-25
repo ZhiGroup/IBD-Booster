@@ -1,33 +1,43 @@
 # IBD-Booster
 
-#### to start, run the pipeline.sh script
+Fast IBD segment detection from phased VCF files using PBWT with integrated P-smoother error correction.
 
-./pipeline.sh <desired name stem> <AFR population size> <EUR population size> <maf frequency cutoff> <genotyping error> <genetic map> <nCPUs for ground truth extraction> <random seed>
-ex: ./pipeline.sh test 200 200 0.05 0.001 data/genetic_map_GRCh38_chr20.txt 10 1
+## Building
 
-run src/findFalseIBDs.sh with the hap-IBD results and the hap-IBD + P_smoother results
-format: src/findFalseIBDs.sh <reported output> <ground truth segments> <centimorgan cutoff> <threshold for falseness>
-creates reported "true" and "false" segments, along with reporting accuracy, power, extraction
+```bash
+mkdir build && cd build
+cmake ..
+make -j
+```
 
-format: python src/constructDataset.py <unsmoothed vcf> <smoothed vcf> <ground truth segments> <"true" reported segments> <"false" reported segments> <n_chunks> <rate_map_file>  <output file name>
+## Usage
 
-#### to get the boosted segments, run:
-python src/segmentAugmentation.py <constructed_dataset
+```bash
+./IBD-Booster <input.vcf.gz> <genetic_map.map> [options]
+```
 
+## Parameters
 
-Dependencies
-Python
-- tskit
-- msprime
-- numpy
-- tqdm
-- stdpopsim
-- pytorch
-- XGBoost
-- pandas
+### Command-line Options
 
-Other
-- bcftools
+| Option | Description | Default |
+|--------|-------------|---------|
+| `--threads=N` | Number of threads | 1 |
+| `--ps-length=N` | P-smoother block length | 20 |
+| `--ps-width=N` | P-smoother minimum block width | 20 |
+| `--ps-gap=N` | P-smoother gap size | 1 |
+| `--ps-rho=F` | P-smoother error rate threshold | 0.05 |
 
+### IBD Detection Parameters (defaults)
 
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| min-seed | Minimum cM length of seed IBS segment | 2.0 |
+| max-gap | Maximum base-pair gap for extending seed segments | 1000 |
+| min-extend | Minimum cM length of IBS segment that can extend a seed | min(1.0, min-seed) |
+| min-markers | Minimum number of markers in seed/extension segments | 100 |
+| min-mac | Minimum minor allele count (markers below threshold excluded) | 2 |
 
+## Output
+
+Writes IBD segments to stdout in tab-separated format.
