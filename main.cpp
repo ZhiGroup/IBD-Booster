@@ -224,11 +224,25 @@ void collectSeedsSimple(
     int na = 0;
     int nb = 0;
 
-    // Pre-allocated alleles cache
+    // Thread-local caches for cache-friendly O(n²) pair processing
+    // OPTIMIZATION: Cache incrementally during counting to avoid redundant get_hap() calls
     thread_local std::vector<uint8_t> alleles_cache;
-    if ((int)alleles_cache.size() < M) alleles_cache.resize(M);
+    thread_local std::vector<int32_t> d_cache;      // Cache D values
+    thread_local std::vector<int32_t> hapid_cache;  // Cache haplotype IDs
+    if ((int)alleles_cache.size() < M) {
+        alleles_cache.resize(M);
+        d_cache.resize(M);
+        hapid_cache.resize(M);
+    }
+
+    // Precompute constants for this site
+    const int seed_end = site_idx - 1;
+    const double genPos_seed_end = (site_idx > 0) ? genPos[seed_end] : 0.0;
+    const double genPos_site_idx = genPos[site_idx];
+    const bool is_last_marker = (site_idx == LastMarker);
 
     // Normal PBWT seed collection loop
+    // OPTIMIZATION: Cache alleles/D/hapid incrementally during counting (single get_hap per haplotype)
     for (int i = 0; i < M; ++i) {
         int hap_id = st.A[i];
         int divergence = st.D[i];
@@ -237,32 +251,28 @@ void collectSeedsSimple(
         if (divergence > site_idx - minMarkers) {
             int block_size = i - i0;
 
-            if (block_size >= 2 && ((na && nb) || site_idx == LastMarker)) {
-                // Cache alleles for this block
-                for (int idx = i0; idx < i; ++idx) {
-                    alleles_cache[idx - i0] = get_hap(site_idx, st.A[idx], meta, hap_data);
-                }
-
-                // Process pairs
-                for (int ia = i0; ia < i; ++ia) {
+            if (block_size >= 2 && ((na && nb) || is_last_marker)) {
+                // Data already cached incrementally - process pairs directly
+                for (int ia = 0; ia < block_size; ++ia) {
                     int dmin = 0;
-                    uint8_t a1 = alleles_cache[ia - i0];
+                    uint8_t a1 = alleles_cache[ia];
+                    int hap1 = hapid_cache[ia];
 
-                    for (int ib = ia + 1; ib < i; ++ib) {
-                        if (st.D[ib] > dmin) dmin = st.D[ib];
-                        uint8_t a2 = alleles_cache[ib - i0];
+                    for (int ib = ia + 1; ib < block_size; ++ib) {
+                        int d_val = d_cache[ib];
+                        if (d_val > dmin) dmin = d_val;
+                        uint8_t a2 = alleles_cache[ib];
 
                         if (a1 != a2) {
-                            int seed_end = site_idx - 1;
-                            double length = genPos[seed_end] - genPos[dmin];
+                            double length = genPos_seed_end - genPos[dmin];
                             int num_markers = seed_end - dmin + 1;
                             if (length >= minSeedMatch && num_markers >= minMarkers)
-                                seeds.emplace_back(Seed{st.A[ia], st.A[ib], dmin, seed_end});
-                        } else if (site_idx == LastMarker) {
-                            double length = genPos[site_idx] - genPos[dmin];
+                                seeds.emplace_back(Seed{hap1, hapid_cache[ib], dmin, seed_end});
+                        } else if (is_last_marker) {
+                            double length = genPos_site_idx - genPos[dmin];
                             int num_markers = site_idx - dmin + 1;
                             if (length >= minSeedMatch && num_markers >= minMarkers)
-                                seeds.emplace_back(Seed{st.A[ia], st.A[ib], dmin, site_idx});
+                                seeds.emplace_back(Seed{hap1, hapid_cache[ib], dmin, site_idx});
                         }
                     }
                 }
@@ -271,38 +281,39 @@ void collectSeedsSimple(
             i0 = i;
         }
 
-        // Count alleles in block
-        bool allele = get_hap(site_idx, hap_id, meta, hap_data);
+        // Cache + count in one operation (eliminates redundant get_hap call)
+        int local_idx = i - i0;
+        uint8_t allele = get_hap(site_idx, hap_id, meta, hap_data);
+        hapid_cache[local_idx] = hap_id;
+        alleles_cache[local_idx] = allele;
+        d_cache[local_idx] = divergence;
         if (allele == 0) na++;
         else nb++;
     }
 
-    // Process final block
+    // Process final block - data already cached incrementally
     int final_block_size = M - i0;
-    if (final_block_size >= 2 && ((na && nb) || site_idx == LastMarker)) {
-        for (int idx = i0; idx < M; ++idx) {
-            alleles_cache[idx - i0] = get_hap(site_idx, st.A[idx], meta, hap_data);
-        }
-
-        for (int ia = i0; ia < M; ++ia) {
+    if (final_block_size >= 2 && ((na && nb) || is_last_marker)) {
+        for (int ia = 0; ia < final_block_size; ++ia) {
             int dmin = 0;
-            uint8_t a1 = alleles_cache[ia - i0];
+            uint8_t a1 = alleles_cache[ia];
+            int hap1 = hapid_cache[ia];
 
-            for (int ib = ia + 1; ib < M; ++ib) {
-                if (st.D[ib] > dmin) dmin = st.D[ib];
-                uint8_t a2 = alleles_cache[ib - i0];
+            for (int ib = ia + 1; ib < final_block_size; ++ib) {
+                int d_val = d_cache[ib];
+                if (d_val > dmin) dmin = d_val;
+                uint8_t a2 = alleles_cache[ib];
 
                 if (a1 != a2) {
-                    int seed_end = site_idx - 1;
-                    double length = genPos[seed_end] - genPos[dmin];
+                    double length = genPos_seed_end - genPos[dmin];
                     int num_markers = seed_end - dmin + 1;
                     if (length >= minSeedMatch && num_markers >= minMarkers)
-                        seeds.emplace_back(Seed{st.A[ia], st.A[ib], dmin, seed_end});
-                } else if (site_idx == LastMarker) {
-                    double length = genPos[site_idx] - genPos[dmin];
+                        seeds.emplace_back(Seed{hap1, hapid_cache[ib], dmin, seed_end});
+                } else if (is_last_marker) {
+                    double length = genPos_site_idx - genPos[dmin];
                     int num_markers = site_idx - dmin + 1;
                     if (length >= minSeedMatch && num_markers >= minMarkers)
-                        seeds.emplace_back(Seed{st.A[ia], st.A[ib], dmin, site_idx});
+                        seeds.emplace_back(Seed{hap1, hapid_cache[ib], dmin, site_idx});
                 }
             }
         }
@@ -509,13 +520,26 @@ void collectSeeds(
     int na = 0;
     int nb = 0;
 
-    // Thread-local alleles cache to avoid repeated allocation
+    // Thread-local caches for cache-friendly O(n²) pair processing
+    // OPTIMIZATION: Cache alleles/D/hapid incrementally during counting to avoid
+    // redundant get_hap() calls (was reading each allele twice: once for counting, once for caching)
     thread_local std::vector<uint8_t> alleles_cache;
-    if ((int)alleles_cache.size() < M) alleles_cache.resize(M);
+    thread_local std::vector<int32_t> d_cache;      // Cache D values (avoid st.D[] lookups in inner loop)
+    thread_local std::vector<int32_t> hapid_cache;  // Cache haplotype IDs (avoid st.A[] lookups)
+    if ((int)alleles_cache.size() < M) {
+        alleles_cache.resize(M);
+        d_cache.resize(M);
+        hapid_cache.resize(M);
+    }
+
+    // Precompute constants for this site
+    const int seed_end_const = site_idx - 1;
+    const bool is_closeout = isLastWindow && site_idx == windowEnd;
 
     // Normal PBWT seed collection loop
     // Java uses: if (d[j] <= maxIbsStart) to detect matching blocks
     // This accounts for genetic distance, not just marker count
+    // OPTIMIZATION: Cache alleles/D/hapid incrementally during counting (single get_hap per haplotype)
     for (int i = 0; i < M; ++i) {
         int hap_id = st.A[i];
         int divergence = st.D[i];
@@ -527,28 +551,26 @@ void collectSeeds(
 
             // PHASE 1 OPTIMIZATION: Early exit for trivial block (size < 2)
             // Process if polymorphic (na && nb) OR last window close-out
-            if (block_size >= 2 && ((na && nb) || (isLastWindow && site_idx == windowEnd))) {
-                // Cache all alleles in this block ONCE (no resize needed - using full allocation)
-                for (int idx = i0; idx < i; ++idx) {
-                    alleles_cache[idx - i0] = get_hap(site_idx, st.A[idx], meta, hap_data);
-                }
-
-                // Now use cached alleles instead of calling get_hap() repeatedly
-                for (int ia = i0; ia < i; ++ia) {
+            if (block_size >= 2 && ((na && nb) || is_closeout)) {
+                // Data already cached incrementally - process pairs directly using cached values
+                for (int ia = 0; ia < block_size; ++ia) {
                     int dmin = 0;
-                    uint8_t a1 = alleles_cache[ia - i0];  // Cached value
+                    uint8_t a1 = alleles_cache[ia];
+                    int hap1 = hapid_cache[ia];
 
-                    for (int ib = ia + 1; ib < i; ++ib) {
-                        if (st.D[ib] > dmin) dmin = st.D[ib];
-                        uint8_t a2 = alleles_cache[ib - i0];  // Cached value
+                    for (int ib = ia + 1; ib < block_size; ++ib) {
+                        int d_val = d_cache[ib];
+                        if (d_val > dmin) dmin = d_val;
+                        uint8_t a2 = alleles_cache[ib];
+                        int hap2 = hapid_cache[ib];
 
                         // Normalize haplotype order for consistent dedup across windows
-                        int h1 = st.A[ia], h2 = st.A[ib];
+                        int h1 = hap1, h2 = hap2;
                         if (h1 > h2) std::swap(h1, h2);
 
                         if (a1 != a2) {
                             // Mismatch: seed ends at site BEFORE the mismatch
-                            int seed_end = site_idx - 1;
+                            int seed_end = seed_end_const;
 
                             // Check range first (seed must end at or after collectionStart-1)
                             bool in_range = (seed_end >= collectionStart) ||
@@ -570,6 +592,7 @@ void collectSeeds(
                             // For mismatch seeds (a1 != a2), the upcoming pbwt_step would set divergence,
                             // so we use site_idx as the effective dmin for the is_new_seed check.
                             // This makes (site_idx > windowStart) true within the collection window.
+                            // NOTE: get_hap calls here are for dmin-1, a DIFFERENT site - cannot be cached
                             int effective_dmin_for_newcheck = std::max(dmin, site_idx);
                             bool is_new_seed = (windowStart == 0) || (effective_dmin_for_newcheck > windowStart) ||
                                 (dmin > 0 && get_hap(dmin - 1, h1, meta, hap_data) !=
@@ -591,7 +614,7 @@ void collectSeeds(
                             if (length >= minSeedMatch && num_markers >= minMarkers && true_dmin <= maxIbsStart) {
                                 seeds.emplace_back(Seed{h1, h2, true_dmin, seed_end});
                             }
-                        } else if (isLastWindow && site_idx == windowEnd) {
+                        } else if (is_closeout) {
                             // Close-out ONLY for last window - no more overlapping windows to catch these seeds
                             // Intermediate windows: seeds continue into overlapping windows
                             if (dmin > windowStart) {
@@ -629,39 +652,42 @@ void collectSeeds(
             i0 = i;
         }
 
-        // Count alleles in block
-        bool allele = get_hap(site_idx, hap_id, meta, hap_data);
+        // Cache + count in one operation (eliminates redundant get_hap call)
+        // Previously: counted alleles here, then re-read them during block flush
+        int local_idx = i - i0;
+        uint8_t allele = get_hap(site_idx, hap_id, meta, hap_data);
+        hapid_cache[local_idx] = hap_id;
+        alleles_cache[local_idx] = allele;
+        d_cache[local_idx] = divergence;
         if (allele == 0) na++;
         else nb++;
     }
 
-    // Process any remaining block
+    // Process any remaining block - data already cached incrementally
     int final_block_size = M - i0;
 
     // PHASE 1 OPTIMIZATION: Early exit for trivial final block
     // Process if polymorphic (na && nb) OR last window close-out
-    if (final_block_size >= 2 && ((na && nb) || (isLastWindow && site_idx == windowEnd))) {
-        // Cache all alleles in final block ONCE (no resize needed - using full allocation)
-        for (int idx = i0; idx < M; ++idx) {
-            alleles_cache[idx - i0] = get_hap(site_idx, st.A[idx], meta, hap_data);
-        }
-
-        // Now use cached alleles
-        for (int ia = i0; ia < M; ++ia) {
+    if (final_block_size >= 2 && ((na && nb) || is_closeout)) {
+        // Use cached values directly (no separate caching loop needed)
+        for (int ia = 0; ia < final_block_size; ++ia) {
             int dmin = 0;
-            uint8_t a1 = alleles_cache[ia - i0];  // Cached value
+            uint8_t a1 = alleles_cache[ia];
+            int hap1 = hapid_cache[ia];
 
-            for (int ib = ia + 1; ib < M; ++ib) {
-                if (st.D[ib] > dmin) dmin = st.D[ib];
-                uint8_t a2 = alleles_cache[ib - i0];  // Cached value
+            for (int ib = ia + 1; ib < final_block_size; ++ib) {
+                int d_val = d_cache[ib];
+                if (d_val > dmin) dmin = d_val;
+                uint8_t a2 = alleles_cache[ib];
+                int hap2 = hapid_cache[ib];
 
                 // Normalize haplotype order for consistent dedup across windows
-                int h1 = st.A[ia], h2 = st.A[ib];
+                int h1 = hap1, h2 = hap2;
                 if (h1 > h2) std::swap(h1, h2);
 
                 if (a1 != a2) {
                     // Mismatch: seed ends at site BEFORE the mismatch
-                    int seed_end = site_idx - 1;
+                    int seed_end = seed_end_const;
 
                     // Check range first
                     bool in_range = (seed_end >= collectionStart) ||
@@ -675,6 +701,7 @@ void collectSeeds(
                     }
 
                     // is_new_seed check with timing fix (same as above)
+                    // NOTE: get_hap calls for dmin-1 cannot be cached (different site)
                     int effective_dmin_for_newcheck = std::max(dmin, site_idx);
                     bool is_new_seed = (windowStart == 0) || (effective_dmin_for_newcheck > windowStart) ||
                         (dmin > 0 && get_hap(dmin - 1, h1, meta, hap_data) !=
@@ -696,7 +723,7 @@ void collectSeeds(
                     if (length >= minSeedMatch && num_markers >= minMarkers && true_dmin <= maxIbsStart) {
                         seeds.emplace_back(Seed{h1, h2, true_dmin, seed_end});
                     }
-                } else if (isLastWindow && site_idx == windowEnd) {
+                } else if (is_closeout) {
                     // Close-out ONLY for last window
                     if (dmin > windowStart) {
                         double prelim_length = genPos[site_idx] - genPos[dmin];
