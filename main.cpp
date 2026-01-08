@@ -53,6 +53,17 @@
 #include <windows.h>
 #endif
 
+// SIMD for accelerated haplotype comparison
+// AVX-512 (512 bits = 512 sites at a time) > AVX2 (256 bits) > 64-bit scalar
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+#include <immintrin.h>
+#define USE_AVX512 1
+#define USE_AVX2 1
+#elif defined(__AVX2__)
+#include <immintrin.h>
+#define USE_AVX2 1
+#endif
+
 // Pin a thread to a specific CPU core for better cache locality
 inline void pinThreadToCore(std::thread& t, int core_id) {
 #ifdef __linux__
@@ -142,6 +153,92 @@ struct HapMajorData {
     inline const uint8_t* hapPtr(int hap) const {
         return data.data() + (size_t)hap * bytes_per_hap;
     }
+
+    // Fast 64-bit backward scan to find first mismatch position (scanning backwards)
+    // Returns the first matching position (inclusive), or 0 if matches to beginning
+    // Much faster than bit-by-bit allelesMatch() loop
+    inline int extendMatchBackward64(int hap1, int hap2, int start) const {
+        if (start <= 0) return start;
+
+        const uint8_t* __restrict h1_ptr = data.data() + (size_t)hap1 * bytes_per_hap;
+        const uint8_t* __restrict h2_ptr = data.data() + (size_t)hap2 * bytes_per_hap;
+
+        int m = start - 1;
+
+        // 64-bit word scanning backwards: skip 64 matching sites at once when byte-aligned
+        while (m >= 63) {
+            int word_start_byte = (m - 63) >> 3;
+            if (((m - 63) & 7) == 0) {  // Byte-aligned
+                uint64_t w1, w2;
+                memcpy(&w1, h1_ptr + word_start_byte, 8);
+                memcpy(&w2, h2_ptr + word_start_byte, 8);
+                uint64_t xor_word = w1 ^ w2;
+                if (xor_word == 0) {
+                    m -= 64;  // Skip 64 matching sites
+                    continue;
+                }
+                // Has mismatches - find highest set bit (last mismatch in this word)
+                int highest_mismatch = 63 - __builtin_clzll(xor_word);
+                return (m - 63) + highest_mismatch + 1;  // Return first matching position after mismatch
+            }
+            break;  // Not aligned, switch to bit-by-bit
+        }
+
+        // Bit-by-bit for remaining sites or unaligned start
+        while (m >= 0) {
+            const int byte_idx = m >> 3;
+            const int bit_idx = m & 7;
+            if ((h1_ptr[byte_idx] ^ h2_ptr[byte_idx]) >> bit_idx & 1) {
+                return m + 1;  // Mismatch at m, return m+1 as first match
+            }
+            --m;
+        }
+
+        return 0;  // Matched all the way to beginning
+    }
+
+    // Fast 64-bit forward scan to find first mismatch position
+    // Returns the last matching position (inclusive), or LastMarker if matches to end
+    // Much faster than bit-by-bit allelesMatch() loop
+    inline int extendMatchForward64(int hap1, int hap2, int start, int LastMarker) const {
+        if (start >= LastMarker) return start;
+
+        const uint8_t* __restrict h1_ptr = data.data() + (size_t)hap1 * bytes_per_hap;
+        const uint8_t* __restrict h2_ptr = data.data() + (size_t)hap2 * bytes_per_hap;
+
+        int m = start + 1;
+
+        // 64-bit word scanning: skip 64 matching sites at once when byte-aligned
+        while (m + 64 <= LastMarker) {
+            if ((m & 7) == 0) {  // m is byte-aligned
+                int word_start_byte = m >> 3;
+                uint64_t w1, w2;
+                memcpy(&w1, h1_ptr + word_start_byte, 8);
+                memcpy(&w2, h2_ptr + word_start_byte, 8);
+                uint64_t xor_word = w1 ^ w2;
+                if (xor_word == 0) {
+                    m += 64;  // Skip 64 matching sites
+                    continue;
+                }
+                // Has mismatches - find lowest set bit (first mismatch)
+                int lowest_mismatch = __builtin_ctzll(xor_word);
+                return m + lowest_mismatch - 1;  // Return last matching position
+            }
+            break;  // Not aligned, switch to bit-by-bit
+        }
+
+        // Bit-by-bit for remaining sites or unaligned start
+        while (m <= LastMarker) {
+            const int byte_idx = m >> 3;
+            const int bit_idx = m & 7;
+            if ((h1_ptr[byte_idx] ^ h2_ptr[byte_idx]) >> bit_idx & 1) {
+                return m - 1;  // Mismatch at m, return m-1 as last match
+            }
+            ++m;
+        }
+
+        return LastMarker;  // Matched all the way to end
+    }
 };
 
 // Merge overlapping seeds for the same haplotype pair
@@ -189,6 +286,56 @@ inline void mergeSeeds(std::vector<Seed>& seeds) {
 }
 
 /**
+ * Find true divergence point by scanning backward using hap_major layout.
+ * This is a simplified version of nextStartHapMajor without gap handling,
+ * used for fast true_dmin computation during seed collection.
+ *
+ * @return The site index where haplotypes first differ (true_dmin)
+ */
+inline int findTrueDmin(int hap1, int hap2, int dmin,
+                        const HapMajorData& hap_major)
+{
+    if (dmin <= 0) return 0;
+
+    const int bytes_per_hap = hap_major.bytes_per_hap;
+    const uint8_t* __restrict h1_ptr = hap_major.data.data() + (size_t)hap1 * bytes_per_hap;
+    const uint8_t* __restrict h2_ptr = hap_major.data.data() + (size_t)hap2 * bytes_per_hap;
+
+    int m = dmin - 1;
+
+    // 64-bit word scanning backward
+    while (m >= 64) {
+        int word_start_byte = (m - 63) >> 3;
+        if (((m - 63) & 7) == 0) {
+            uint64_t w1, w2;
+            memcpy(&w1, h1_ptr + word_start_byte, 8);
+            memcpy(&w2, h2_ptr + word_start_byte, 8);
+            uint64_t xor_word = w1 ^ w2;
+            if (xor_word == 0) {
+                m -= 64;
+                continue;
+            }
+            // Found mismatch - return position after it
+            int highest_mismatch = 63 - __builtin_clzll(xor_word);
+            return (m - 63) + highest_mismatch + 1;
+        }
+        break;
+    }
+
+    // Bit-by-bit for remainder
+    while (m >= 0) {
+        int byte_idx = m >> 3;
+        int bit_idx = m & 7;
+        if ((h1_ptr[byte_idx] ^ h2_ptr[byte_idx]) >> bit_idx & 1) {
+            return m + 1;  // Mismatch at m, so true_dmin is m+1
+        }
+        --m;
+    }
+
+    return 0;
+}
+
+/**
  * Collect IBD seeds at a single site using PBWT divergence array.
  *
  * The PBWT maintains haplotypes in sorted order by their prefix. Haplotypes
@@ -215,6 +362,7 @@ void collectSeedsSimple(
     std::vector<Seed>& seeds,
     const HapMetadata &meta,
     const HapData &hap_data,
+    const HapMajorData& hap_major,  // For fast true_dmin computation
     const std::vector<double>& genPos,
     double minSeedMatch,
     int minMarkers)
@@ -258,20 +406,25 @@ void collectSeedsSimple(
                     uint8_t a1 = alleles_cache[ia];
                     int hap1 = hapid_cache[ia];
 
+                    // Precompute threshold: dmin must be <= site_idx - minMarkers for enough markers
+                    const int dmin_threshold = site_idx - minMarkers;
+
                     for (int ib = ia + 1; ib < block_size; ++ib) {
                         int d_val = d_cache[ib];
                         if (d_val > dmin) dmin = d_val;
+
+                        // Early break: once dmin exceeds threshold, all subsequent ib will also fail
+                        if (dmin > dmin_threshold) break;
+
                         uint8_t a2 = alleles_cache[ib];
 
                         if (a1 != a2) {
                             double length = genPos_seed_end - genPos[dmin];
-                            int num_markers = seed_end - dmin + 1;
-                            if (length >= minSeedMatch && num_markers >= minMarkers)
+                            if (length >= minSeedMatch)
                                 seeds.emplace_back(Seed{hap1, hapid_cache[ib], dmin, seed_end});
                         } else if (is_last_marker) {
                             double length = genPos_site_idx - genPos[dmin];
-                            int num_markers = site_idx - dmin + 1;
-                            if (length >= minSeedMatch && num_markers >= minMarkers)
+                            if (length >= minSeedMatch)
                                 seeds.emplace_back(Seed{hap1, hapid_cache[ib], dmin, site_idx});
                         }
                     }
@@ -294,6 +447,9 @@ void collectSeedsSimple(
     // Process final block - data already cached incrementally
     int final_block_size = M - i0;
     if (final_block_size >= 2 && ((na && nb) || is_last_marker)) {
+        // Precompute threshold: dmin must be <= site_idx - minMarkers for enough markers
+        const int dmin_threshold = site_idx - minMarkers;
+
         for (int ia = 0; ia < final_block_size; ++ia) {
             int dmin = 0;
             uint8_t a1 = alleles_cache[ia];
@@ -302,17 +458,19 @@ void collectSeedsSimple(
             for (int ib = ia + 1; ib < final_block_size; ++ib) {
                 int d_val = d_cache[ib];
                 if (d_val > dmin) dmin = d_val;
+
+                // Early break: once dmin exceeds threshold, all subsequent ib will also fail
+                if (dmin > dmin_threshold) break;
+
                 uint8_t a2 = alleles_cache[ib];
 
                 if (a1 != a2) {
                     double length = genPos_seed_end - genPos[dmin];
-                    int num_markers = seed_end - dmin + 1;
-                    if (length >= minSeedMatch && num_markers >= minMarkers)
+                    if (length >= minSeedMatch)
                         seeds.emplace_back(Seed{hap1, hapid_cache[ib], dmin, seed_end});
                 } else if (is_last_marker) {
                     double length = genPos_site_idx - genPos[dmin];
-                    int num_markers = site_idx - dmin + 1;
-                    if (length >= minSeedMatch && num_markers >= minMarkers)
+                    if (length >= minSeedMatch)
                         seeds.emplace_back(Seed{hap1, hapid_cache[ib], dmin, site_idx});
                 }
             }
@@ -506,6 +664,7 @@ void collectSeeds(
     std::vector<Seed>& seeds,
     const HapMetadata &meta,
     const HapData &hap_data,
+    const HapMajorData& hap_major,  // For fast true_dmin computation
     const std::vector<double>& genPos,
     double minSeedMatch,
     int minMarkers,
@@ -599,15 +758,10 @@ void collectSeeds(
                                              get_hap(dmin - 1, h2, meta, hap_data));
                             if (!is_new_seed) continue;
 
-                            // Compute true_dmin (only searches backward when dmin is truncated)
-                            int true_dmin = dmin;
-                            if (dmin <= windowStart && windowStart > 0) {
-                                while (true_dmin > 0 &&
-                                       get_hap(true_dmin - 1, h1, meta, hap_data) ==
-                                       get_hap(true_dmin - 1, h2, meta, hap_data)) {
-                                    true_dmin--;
-                                }
-                            }
+                            // Compute true_dmin using fast hap_major scan (only when truncated)
+                            int true_dmin = (dmin <= windowStart && windowStart > 0)
+                                          ? findTrueDmin(h1, h2, dmin, hap_major)
+                                          : dmin;
 
                             double length = genPos[seed_end] - genPos[true_dmin];
                             int num_markers = seed_end - true_dmin + 1;
@@ -617,19 +771,17 @@ void collectSeeds(
                         } else if (is_closeout) {
                             // Close-out ONLY for last window - no more overlapping windows to catch these seeds
                             // Intermediate windows: seeds continue into overlapping windows
+
+                            // OPTIMIZATION: Early reject ONLY when dmin is NOT truncated
                             if (dmin > windowStart) {
                                 double prelim_length = genPos[site_idx] - genPos[dmin];
                                 if (prelim_length < minSeedMatch || dmin > maxIbsStart) continue;
                             }
 
-                            int true_dmin = dmin;
-                            if (dmin <= windowStart && windowStart > 0) {
-                                while (true_dmin > 0 &&
-                                       get_hap(true_dmin - 1, h1, meta, hap_data) ==
-                                       get_hap(true_dmin - 1, h2, meta, hap_data)) {
-                                    true_dmin--;
-                                }
-                            }
+                            // Compute true_dmin using fast hap_major scan (only when truncated)
+                            int true_dmin = (dmin <= windowStart && windowStart > 0)
+                                          ? findTrueDmin(h1, h2, dmin, hap_major)
+                                          : dmin;
 
                             // For close-out, use same timing adjustment as mismatch seeds.
                             // After Java's PBWT update, ibsStart would be site_idx+1.
@@ -708,15 +860,10 @@ void collectSeeds(
                                      get_hap(dmin - 1, h2, meta, hap_data));
                     if (!is_new_seed) continue;
 
-                    // Compute true_dmin
-                    int true_dmin = dmin;
-                    if (dmin <= windowStart && windowStart > 0) {
-                        while (true_dmin > 0 &&
-                               get_hap(true_dmin - 1, h1, meta, hap_data) ==
-                               get_hap(true_dmin - 1, h2, meta, hap_data)) {
-                            true_dmin--;
-                        }
-                    }
+                    // Compute true_dmin using fast hap_major scan (only when truncated)
+                    int true_dmin = (dmin <= windowStart && windowStart > 0)
+                                  ? findTrueDmin(h1, h2, dmin, hap_major)
+                                  : dmin;
 
                     double length = genPos[seed_end] - genPos[true_dmin];
                     int num_markers = seed_end - true_dmin + 1;
@@ -725,19 +872,16 @@ void collectSeeds(
                     }
                 } else if (is_closeout) {
                     // Close-out ONLY for last window
+                    // OPTIMIZATION: Early reject ONLY when dmin is NOT truncated
                     if (dmin > windowStart) {
                         double prelim_length = genPos[site_idx] - genPos[dmin];
                         if (prelim_length < minSeedMatch || dmin > maxIbsStart) continue;
                     }
 
-                    int true_dmin = dmin;
-                    if (dmin <= windowStart && windowStart > 0) {
-                        while (true_dmin > 0 &&
-                               get_hap(true_dmin - 1, h1, meta, hap_data) ==
-                               get_hap(true_dmin - 1, h2, meta, hap_data)) {
-                            true_dmin--;
-                        }
-                    }
+                    // Compute true_dmin using fast hap_major scan (only when truncated)
+                    int true_dmin = (dmin <= windowStart && windowStart > 0)
+                                  ? findTrueDmin(h1, h2, dmin, hap_major)
+                                  : dmin;
 
                     // Close-out with timing adjustment (same as mismatch seeds)
                     int effective_dmin_for_newcheck = std::max(dmin, site_idx);
@@ -818,13 +962,76 @@ inline int nextStartHapMajor(int hap1, int hap2, int start,
     int firstMatch = start - 2;
 
     // Prefetch the memory region we'll be scanning (backwards)
-    if (m >= 64) {
-        __builtin_prefetch(h1_ptr + ((m - 64) >> 3), 0, 3);
-        __builtin_prefetch(h2_ptr + ((m - 64) >> 3), 0, 3);
+    if (m >= 512) {
+        __builtin_prefetch(h1_ptr + ((m - 512) >> 3), 0, 3);
+        __builtin_prefetch(h2_ptr + ((m - 512) >> 3), 0, 3);
     }
 
+#ifdef USE_AVX512
+    // AVX-512: 512-bit scanning (512 sites at a time) - 8x faster than 64-bit
+    while (m >= 512) {
+        if (((m - 511) & 7) == 0) {  // Byte-aligned
+            int word_start_byte = (m - 511) >> 3;
+            __m512i v1 = _mm512_loadu_si512((const __m512i*)(h1_ptr + word_start_byte));
+            __m512i v2 = _mm512_loadu_si512((const __m512i*)(h2_ptr + word_start_byte));
+            __m512i xor_result = _mm512_xor_si512(v1, v2);
+
+            if (_mm512_test_epi64_mask(xor_result, xor_result) == 0) {
+                m -= 512;  // All 512 bits match, skip ahead
+                continue;
+            }
+
+            // Has mismatches - find the highest set bit position
+            alignas(64) uint64_t words[8];
+            _mm512_store_si512((__m512i*)words, xor_result);
+
+            for (int i = 7; i >= 0; --i) {
+                if (words[i] != 0) {
+                    int highest_mismatch = 63 - __builtin_clzll(words[i]);
+                    m = (m - 511) + i * 64 + highest_mismatch;
+                    break;
+                }
+            }
+        }
+        break;
+    }
+#endif
+
+#ifdef USE_AVX2
+    // AVX2: 256-bit scanning (256 sites at a time) - 4x faster than 64-bit
+    while (m >= 256) {
+        // Check alignment: we want bits [m-255, m] to be in 32 consecutive bytes
+        if (((m - 255) & 7) == 0) {  // Byte-aligned
+            int word_start_byte = (m - 255) >> 3;
+            __m256i v1 = _mm256_loadu_si256((const __m256i*)(h1_ptr + word_start_byte));
+            __m256i v2 = _mm256_loadu_si256((const __m256i*)(h2_ptr + word_start_byte));
+            __m256i xor_result = _mm256_xor_si256(v1, v2);
+
+            if (_mm256_testz_si256(xor_result, xor_result)) {
+                m -= 256;  // All 256 bits match, skip ahead
+                continue;
+            }
+
+            // Has mismatches - find the highest set bit position
+            // Extract as 4 x 64-bit words (words[3] contains highest sites [m-63, m])
+            alignas(32) uint64_t words[4];
+            _mm256_store_si256((__m256i*)words, xor_result);
+
+            // Check from highest to lowest word
+            for (int i = 3; i >= 0; --i) {
+                if (words[i] != 0) {
+                    int highest_mismatch = 63 - __builtin_clzll(words[i]);
+                    m = (m - 255) + i * 64 + highest_mismatch;
+                    break;
+                }
+            }
+        }
+        break;  // Not aligned or found mismatch, switch to finer scanning
+    }
+#endif
+
     // 64-bit word scanning: skip 64 matching sites at once when aligned
-    // Then fall through to bit-by-bit for remainder
+    // Fallback for non-AVX2 or when fewer than 256 sites remain
     while (m >= 64) {
         // Check alignment: we want bits [m-63, m] to be in one 64-bit word
         int word_start_byte = (m - 63) >> 3;
@@ -904,12 +1111,76 @@ inline int nextEndHapMajor(int hap1, int hap2, int end,
     int firstMatch = end + 2;
 
     // Prefetch the memory region we'll be scanning (forwards)
-    if (m + 64 < LastMarker) {
-        __builtin_prefetch(h1_ptr + ((m + 64) >> 3), 0, 3);
-        __builtin_prefetch(h2_ptr + ((m + 64) >> 3), 0, 3);
+    if (m + 512 < LastMarker) {
+        __builtin_prefetch(h1_ptr + ((m + 512) >> 3), 0, 3);
+        __builtin_prefetch(h2_ptr + ((m + 512) >> 3), 0, 3);
     }
 
+#ifdef USE_AVX512
+    // AVX-512: 512-bit scanning (512 sites at a time) - 8x faster than 64-bit
+    while (m + 512 <= LastMarker) {
+        if ((m & 7) == 0) {  // m is byte-aligned
+            int word_start_byte = m >> 3;
+            __m512i v1 = _mm512_loadu_si512((const __m512i*)(h1_ptr + word_start_byte));
+            __m512i v2 = _mm512_loadu_si512((const __m512i*)(h2_ptr + word_start_byte));
+            __m512i xor_result = _mm512_xor_si512(v1, v2);
+
+            if (_mm512_test_epi64_mask(xor_result, xor_result) == 0) {
+                m += 512;  // All 512 bits match, skip ahead
+                continue;
+            }
+
+            // Has mismatches - find the lowest set bit position
+            alignas(64) uint64_t words[8];
+            _mm512_store_si512((__m512i*)words, xor_result);
+
+            for (int i = 0; i < 8; ++i) {
+                if (words[i] != 0) {
+                    int lowest_mismatch = __builtin_ctzll(words[i]);
+                    m = m + i * 64 + lowest_mismatch;
+                    break;
+                }
+            }
+        }
+        break;
+    }
+#endif
+
+#ifdef USE_AVX2
+    // AVX2: 256-bit scanning (256 sites at a time) - 4x faster than 64-bit
+    while (m + 256 <= LastMarker) {
+        // Check alignment: we want bits [m, m+255] to be in 32 consecutive bytes
+        if ((m & 7) == 0) {  // m is byte-aligned
+            int word_start_byte = m >> 3;
+            __m256i v1 = _mm256_loadu_si256((const __m256i*)(h1_ptr + word_start_byte));
+            __m256i v2 = _mm256_loadu_si256((const __m256i*)(h2_ptr + word_start_byte));
+            __m256i xor_result = _mm256_xor_si256(v1, v2);
+
+            if (_mm256_testz_si256(xor_result, xor_result)) {
+                m += 256;  // All 256 bits match, skip ahead
+                continue;
+            }
+
+            // Has mismatches - find the lowest set bit position
+            // Extract as 4 x 64-bit words (words[0] contains lowest sites [m, m+63])
+            alignas(32) uint64_t words[4];
+            _mm256_store_si256((__m256i*)words, xor_result);
+
+            // Check from lowest to highest word
+            for (int i = 0; i < 4; ++i) {
+                if (words[i] != 0) {
+                    int lowest_mismatch = __builtin_ctzll(words[i]);
+                    m = m + i * 64 + lowest_mismatch;
+                    break;
+                }
+            }
+        }
+        break;  // Not aligned or found mismatch, switch to finer scanning
+    }
+#endif
+
     // 64-bit word scanning: skip 64 matching sites at once when aligned
+    // Fallback for non-AVX2 or when fewer than 256 sites remain
     while (m + 64 <= LastMarker) {
         // Check alignment: we want bits [m, m+63] to be in one 64-bit word
         if ((m & 7) == 0) {  // m is byte-aligned
@@ -1088,8 +1359,9 @@ std::vector<Window> createOverlappingWindows(
     while (end < n_sites && end < min_markers) end++;
 
     // Create windows with minSeed overlap
+    // Note: actual thread count may be 1-2 less than requested due to chromosome length
     int index = 0;
-    while (index < n_threads - 1 && end < n_sites) {
+    while (index < n_threads - 1 && end < n_sites - 1) {
         // Calculate next window's start
         double overlap_cm = genPos[end] - min_seed_cm;
         int next_start = start;
@@ -1163,8 +1435,8 @@ void processSeedBatch(
         int ext_start = seed.start_site;
         int ext_end = seed.end_site;
 
-        // Extend backwards using haplotype-major layout
-        int prevStart = ext_start;
+        // Extend backwards using fast 64-bit scan first, then gap-tolerant extension
+        int prevStart = hap_major.extendMatchBackward64(hap1, hap2, ext_start);
         int nStart = nextStartHapMajor(hap1, hap2, prevStart, genPos, meta, hap_major,
                               MIN_MATCH_CM, MAX_GAP, MIN_MARKERS, MIN_EXTEND, mM1);
 
@@ -1175,11 +1447,8 @@ void processSeedBatch(
         }
 
         if (nStart >= 0) {
-            // Extend forwards - use haplotype-major for allele check
-            int inclEnd = ext_end;
-            while (inclEnd < LastMarker && hap_major.allelesMatch(hap1, hap2, inclEnd + 1)) {
-                ++inclEnd;
-            }
+            // Extend forwards using fast 64-bit word scanning (replaces bit-by-bit loop)
+            int inclEnd = hap_major.extendMatchForward64(hap1, hap2, ext_end, LastMarker);
             int prevInclEnd = inclEnd;
             int nextInclEnd = nextEndHapMajor(hap1, hap2, prevInclEnd, genPos, meta, hap_major,
                                       MIN_MATCH_CM, MAX_GAP, MIN_MARKERS, MIN_EXTEND, LastMarker, mM1);
@@ -1314,7 +1583,7 @@ void runWindowThread(
         // Time seed collection (includes get_site)
         auto t1 = std::chrono::high_resolution_clock::now();
         get_site(site_idx, meta, hap_data, site_buffer);
-        collectSeeds(st, site_idx, seedList, meta, hap_data, genPos,
+        collectSeeds(st, site_idx, seedList, meta, hap_data, hap_major, genPos,
                     MIN_MATCH_CM, MIN_MARKERS, maxIbsStart, start_site, collection_start, end_site,
                     isLastWindow);
         auto t2 = std::chrono::high_resolution_clock::now();
@@ -1394,10 +1663,14 @@ int main(int argc, char** argv) {
         std::cerr << "Usage: " << argv[0] << " <input.vcf|input.vcf.gz> <genetic_map.map> [options]\n\n";
         std::cerr << "Options:\n";
         std::cerr << "  --threads=N       Number of threads (default: 1)\n";
+        std::cerr << "  --min-output=F    Minimum cM length for IBD output segments (default: 2.0)\n";
+        std::cerr << "  --no-psmoother    Skip P-smoother (for pre-smoothed files)\n";
         std::cerr << "  --ps-length=N     P-smoother block length (default: 20)\n";
         std::cerr << "  --ps-width=N      P-smoother minimum block width (default: 20)\n";
         std::cerr << "  --ps-gap=N        P-smoother gap size (default: 1)\n";
         std::cerr << "  --ps-rho=F        P-smoother error rate threshold (default: 0.05)\n";
+        std::cerr << "\nOutput format (tab-separated):\n";
+        std::cerr << "  sample1_idx  hap1  sample2_idx  hap2  start_bp  end_bp  length_cM\n";
         return 1;
     }
 
@@ -1406,12 +1679,18 @@ int main(int argc, char** argv) {
 
     // Parse command-line options
     int nthreads = 1;
+    double min_output = 2.0;  // Minimum cM length for IBD output segments
+    bool skip_psmoother = false;
     PSmootherParams ps_params;  // P-smoother parameters (defaults: L=20, W=20, G=1, rho=0.05)
 
     for (int i = 3; i < argc; ++i) {
         std::string arg = argv[i];
         if (arg.find("--threads=") == 0) {
             nthreads = std::stoi(arg.substr(10));
+        } else if (arg.find("--min-output=") == 0) {
+            min_output = std::stod(arg.substr(13));
+        } else if (arg == "--no-psmoother") {
+            skip_psmoother = true;
         } else if (arg.find("--ps-length=") == 0) {
             ps_params.length = std::stoi(arg.substr(12));
         } else if (arg.find("--ps-width=") == 0) {
@@ -1426,10 +1705,18 @@ int main(int argc, char** argv) {
     ps_params.nthreads = nthreads;
     ps_params.verbose = false;  // Disable detailed P-smoother output
 
+    // Set OpenMP thread limit to match --threads parameter
+    omp_set_num_threads(nthreads);
+
     std::cerr << "[INFO] Using " << nthreads << " thread(s)\n";
-    std::cerr << "[INFO] P-smoother (L=" << ps_params.length
-              << " W=" << ps_params.width << " G=" << ps_params.gap
-              << " rho=" << ps_params.rho << ")\n";
+    std::cerr << "[INFO] min-output=" << min_output << " cM\n";
+    if (skip_psmoother) {
+        std::cerr << "[INFO] P-smoother disabled (--no-psmoother)\n";
+    } else {
+        std::cerr << "[INFO] P-smoother (L=" << ps_params.length
+                  << " W=" << ps_params.width << " G=" << ps_params.gap
+                  << " rho=" << ps_params.rho << ")\n";
+    }
     if (!is_vcf(vcf_path)) {
         std::cerr << "Error: only .vcf or .vcf.gz are supported.\n";
         return 1;
@@ -1443,55 +1730,61 @@ int main(int argc, char** argv) {
     // Flow: VCF → 2D → P-smoother → pack (with minMac filter) → IBD detection
     std::vector<std::vector<uint8_t>> hap_2d;
 
+    auto vcf_start = std::chrono::steady_clock::now();
     try {
         meta = read_vcf_to_2d(vcf_path, hap_2d);
     } catch (const std::exception& e) {
         std::cerr << "ERROR during VCF reading: " << e.what() << "\n";
         return 1;
     }
+    auto vcf_end = std::chrono::steady_clock::now();
 
-    // Run P-smoother for haplotype error correction
-    auto ps_start = std::chrono::steady_clock::now();
-    PSmoother smoother(meta.n_haps, meta.n_sites, ps_params);
-    int corrections = smoother.smooth(hap_2d);
-    auto ps_end = std::chrono::steady_clock::now();
-    double ps_time = std::chrono::duration<double>(ps_end - ps_start).count();
+    // Run P-smoother for haplotype error correction (unless disabled)
+    if (!skip_psmoother) {
+        auto ps_start = std::chrono::steady_clock::now();
+        PSmoother smoother(meta.n_haps, meta.n_sites, ps_params);
+        int corrections = smoother.smooth(hap_2d);
+        auto ps_end = std::chrono::steady_clock::now();
+        double ps_time = std::chrono::duration<double>(ps_end - ps_start).count();
 
-    // Check if file appears already smoothed (correction rate < 0.1%)
-    // P-smoother is not idempotent - running it on already-smoothed data produces spurious corrections
-    // due to PBWT block boundaries shifting after the first smoothing pass
-    double total_alleles = (double)meta.n_haps * meta.n_sites;
-    double correction_rate = (double)corrections / total_alleles;
-    const double ALREADY_SMOOTHED_THRESHOLD = 0.001;  // 0.1%
+        // Check if file appears already smoothed (correction rate < 0.1%)
+        // P-smoother is not idempotent - running it on already-smoothed data produces spurious corrections
+        // due to PBWT block boundaries shifting after the first smoothing pass
+        double total_alleles = (double)meta.n_haps * meta.n_sites;
+        double correction_rate = (double)corrections / total_alleles;
+        const double ALREADY_SMOOTHED_THRESHOLD = 0.001;  // 0.1%
 
-    if (corrections > 0 && correction_rate < ALREADY_SMOOTHED_THRESHOLD) {
-        // Reload original data - file was already smoothed
-        hap_2d.clear();
-        meta = read_vcf_to_2d(vcf_path, hap_2d);
-        corrections = 0;
-    }
-
-    // Write smoothed VCF only if meaningful corrections were made
-    if (corrections > 0) {
-        // Generate output filename in current directory: /path/to/input.vcf.gz -> input_smooth.vcf.gz
-        std::string smoothed_vcf = vcf_path;
-        // Extract just the filename (remove directory path)
-        size_t last_slash = smoothed_vcf.find_last_of("/\\");
-        if (last_slash != std::string::npos) {
-            smoothed_vcf = smoothed_vcf.substr(last_slash + 1);
-        }
-        // Insert _smooth before .vcf extension
-        size_t ext_pos = smoothed_vcf.rfind(".vcf");
-        if (ext_pos != std::string::npos) {
-            smoothed_vcf.insert(ext_pos, "_smooth");
-        } else {
-            smoothed_vcf += "_smooth.vcf.gz";
+        if (corrections > 0 && correction_rate < ALREADY_SMOOTHED_THRESHOLD) {
+            // Reload original data - file was already smoothed
+            std::cerr << "[INFO] File appears already smoothed (correction rate " << (correction_rate * 100) << "% < 0.1%), reloading original\n";
+            hap_2d.clear();
+            meta = read_vcf_to_2d(vcf_path, hap_2d);
+            corrections = 0;
         }
 
-        write_smoothed_vcf(vcf_path, smoothed_vcf, hap_2d, meta, minMac);
+        // Write smoothed VCF only if meaningful corrections were made (async to overlap with IBD detection)
+        if (corrections > 0) {
+            // Generate output filename in current directory: /path/to/input.vcf.gz -> input_smooth.vcf.gz
+            std::string smoothed_vcf = vcf_path;
+            // Extract just the filename (remove directory path)
+            size_t last_slash = smoothed_vcf.find_last_of("/\\");
+            if (last_slash != std::string::npos) {
+                smoothed_vcf = smoothed_vcf.substr(last_slash + 1);
+            }
+            // Insert _smooth before .vcf extension
+            size_t ext_pos = smoothed_vcf.rfind(".vcf");
+            if (ext_pos != std::string::npos) {
+                smoothed_vcf.insert(ext_pos, "_smooth");
+            } else {
+                smoothed_vcf += "_smooth.vcf.gz";
+            }
+
+            // Write smoothed VCF synchronously (before freeing hap_2d)
+            write_smoothed_vcf(vcf_path, smoothed_vcf, hap_2d, meta, minMac);
+        }
     }
 
-    // Recompute MAC from smoothed data (P-smoother changes alleles, affecting MAC)
+    // Recompute MAC (needed for minMac filter)
     recompute_mac(hap_2d, meta);
 
     // Pack to bit-packed format (applies minMac filter)
@@ -1513,8 +1806,8 @@ int main(int argc, char** argv) {
     std::vector<int> vcf_bp = meta.vcf_bp_positions;
     std::vector<double> genPos = interpolateGeneticPositions(gmap, vcf_bp);
 
-    // Parameters
-    double MIN_MATCH_CM = 2.0;
+    // Parameters (min_output defaults to 2.0 if not specified by user)
+    double MIN_MATCH_CM = min_output;
     double MAX_GAP = 1000;
     double MIN_EXTEND = std::min(1.0, MIN_MATCH_CM);
     int MIN_MARKERS = 100;
@@ -1558,8 +1851,8 @@ int main(int argc, char** argv) {
                 int ext_start = seed.start_site;
                 int ext_end = seed.end_site;
 
-                // Extend backwards using haplotype-major layout
-                int prevStart = ext_start;
+                // Extend backwards using fast 64-bit scan first, then gap-tolerant extension
+                int prevStart = hap_major.extendMatchBackward64(hap1, hap2, ext_start);
                 int nStart = nextStartHapMajor(hap1, hap2, prevStart, genPos, meta, hap_major,
                                        MIN_MATCH_CM, MAX_GAP, MIN_MARKERS, MIN_EXTEND, mM1);
 
@@ -1570,11 +1863,8 @@ int main(int argc, char** argv) {
                 }
 
                 if (nStart >= 0) {
-                    // Extend forwards using haplotype-major for allele check
-                    int inclEnd = ext_end;
-                    while (inclEnd < LastMarker && hap_major.allelesMatch(hap1, hap2, inclEnd + 1)) {
-                        ++inclEnd;
-                    }
+                    // Extend forwards using fast 64-bit word scanning (replaces bit-by-bit loop)
+                    int inclEnd = hap_major.extendMatchForward64(hap1, hap2, ext_end, LastMarker);
                     int prevInclEnd = inclEnd;
                     int nextInclEnd = nextEndHapMajor(hap1, hap2, prevInclEnd, genPos, meta, hap_major,
                                               MIN_MATCH_CM, MAX_GAP, MIN_MARKERS, MIN_EXTEND, LastMarker, mM1);
@@ -1604,7 +1894,7 @@ int main(int argc, char** argv) {
         // Simple single-threaded loop
         for (int32_t site_idx = 0; site_idx < n_sites; ++site_idx) {
             get_site(site_idx, meta, hap_data, site_buffer);
-            collectSeedsSimple(st, site_idx, LastMarker, seeds, meta, hap_data, genPos, MIN_MATCH_CM, MIN_MARKERS);
+            collectSeedsSimple(st, site_idx, LastMarker, seeds, meta, hap_data, hap_major, genPos, MIN_MATCH_CM, MIN_MARKERS);
             pbwt_step(site_idx, site_buffer, st);
 
             // Process batch when threshold reached (improves cache locality)
@@ -1617,6 +1907,19 @@ int main(int argc, char** argv) {
         if (!seeds.empty()) {
             processBatch();
         }
+
+        fclose(output_file);
+
+        auto end_time = std::chrono::steady_clock::now();
+        auto total_elapsed = std::chrono::duration_cast<std::chrono::seconds>(end_time - start_time).count();
+
+        std::cout << "\nStatistics\n";
+        std::cout << "  samples          :  " << n_samples << "\n";
+        std::cout << "  markers          :  " << n_sites << "\n";
+        std::cout << "  IBD segments     :  " << segment_count.load() << "\n";
+        std::cout << "  IBD segs/sample  :  "
+                << (n_samples > 0 ? double(segment_count.load()) / n_samples : 0.0) << "\n";
+        std::cout << "Wallclock Time:  " << total_elapsed << " s\n";
     } else {
         // Parallel path (nthreads > 1)
         // Create windows
@@ -1656,18 +1959,18 @@ int main(int argc, char** argv) {
         }
 
         seedQ.markFinished();
+
+        fclose(output_file);
+
+        auto end_time = std::chrono::steady_clock::now();
+        auto total_elapsed = std::chrono::duration_cast<std::chrono::seconds>(end_time - start_time).count();
+
+        std::cout << "\nStatistics\n";
+        std::cout << "  samples          :  " << n_samples << "\n";
+        std::cout << "  markers          :  " << n_sites << "\n";
+        std::cout << "  IBD segments     :  " << segment_count.load() << "\n";
+        std::cout << "  IBD segs/sample  :  "
+                << (n_samples > 0 ? double(segment_count.load()) / n_samples : 0.0) << "\n";
+        std::cout << "Wallclock Time:  " << total_elapsed << " s\n";
     }
-
-    fclose(output_file);
-
-    auto end_time = std::chrono::steady_clock::now();
-    auto total_elapsed = std::chrono::duration_cast<std::chrono::seconds>(end_time - start_time).count();
-
-    std::cout << "\nStatistics\n";
-    std::cout << "  samples          :  " << n_samples << "\n";
-    std::cout << "  markers          :  " << n_sites << "\n";
-    std::cout << "  IBD segments     :  " << segment_count.load() << "\n";
-    std::cout << "  IBD segs/sample  :  "
-            << (n_samples > 0 ? double(segment_count.load()) / n_samples : 0.0) << "\n";
-    std::cout << "Wallclock Time:  " << total_elapsed << " s\n";
 }
