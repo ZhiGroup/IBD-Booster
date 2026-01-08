@@ -36,8 +36,8 @@ add_executable(IBD-Booster ${SRC_FILES})
 # -----------------------------
 include_directories(/data/cchen32/include)
 find_package(ZLIB REQUIRED)
-find_package(OpenMP REQUIRED)
-target_link_libraries(IBD-Booster PRIVATE ZLIB::ZLIB /data/cchen32/lib/libhts.so OpenMP::OpenMP_CXX)
+find_package(Threads REQUIRED)
+target_link_libraries(IBD-Booster PRIVATE ZLIB::ZLIB /data/cchen32/lib/libhts.so Threads::Threads)
 
 # -----------------------------
 # Compiler optimization flags

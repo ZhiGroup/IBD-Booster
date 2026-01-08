@@ -25,7 +25,6 @@
 #include "../include/pbwt.hpp"
 #include "../include/vcf_utils.hpp"
 #include "../include/psmoother.hpp"
-#include <omp.h>
 #include <iostream>
 #include <fstream>
 #include <vector>
@@ -52,6 +51,48 @@
 #elif defined(_WIN32)
 #include <windows.h>
 #endif
+
+// Simple parallel_for using std::thread (replaces OpenMP to avoid thread pool conflicts)
+// Main thread participates in work to use exactly nthreads total
+template<typename Func>
+void parallel_for(int start, int end, int nthreads, Func&& func) {
+    if (nthreads <= 1 || end - start <= 1) {
+        for (int i = start; i < end; ++i) {
+            func(i);
+        }
+        return;
+    }
+
+    int range = end - start;
+    int chunk = (range + nthreads - 1) / nthreads;
+    std::vector<std::thread> threads;
+    threads.reserve(nthreads - 1);  // Main thread handles one chunk
+
+    // Spawn nthreads-1 worker threads for chunks 0 to nthreads-2
+    for (int t = 0; t < nthreads - 1; ++t) {
+        int t_start = start + t * chunk;
+        int t_end = std::min(t_start + chunk, end);
+        if (t_start >= end) break;
+
+        threads.emplace_back([t_start, t_end, &func]() {
+            for (int i = t_start; i < t_end; ++i) {
+                func(i);
+            }
+        });
+    }
+
+    // Main thread handles the last chunk
+    int main_start = start + (nthreads - 1) * chunk;
+    int main_end = end;
+    for (int i = main_start; i < main_end; ++i) {
+        func(i);
+    }
+
+    // Join worker threads
+    for (auto& th : threads) {
+        th.join();
+    }
+}
 
 // SIMD for accelerated haplotype comparison
 // AVX-512 (512 bits = 512 sites at a time) > AVX2 (256 bits) > 64-bit scalar
@@ -107,7 +148,7 @@ struct HapMajorData {
 
     // Transpose from site-major to haplotype-major
     // Parallelized by haplotype (each haplotype writes to its own memory region - no race)
-    void transpose(const HapMetadata& meta, const HapData& site_major) {
+    void transpose(const HapMetadata& meta, const HapData& site_major, int nthreads = 1) {
         n_haps = meta.n_haps;
         n_sites = meta.n_sites;
         bytes_per_hap = (n_sites + 7) / 8;
@@ -118,22 +159,26 @@ struct HapMajorData {
 
         // Transpose: for each haplotype, gather bits from all sites
         // Parallelized by haplotype - each writes to different memory region (no race)
-        #pragma omp parallel for schedule(static)
-        for (int hap = 0; hap < n_haps; ++hap) {
-            uint8_t* hap_ptr = data.data() + (size_t)hap * bytes_per_hap;
+        uint8_t* data_ptr = data.data();
+        const uint8_t* src_ptr = site_major.data();
+        const int local_n_sites = n_sites;
+        const int local_bytes_per_hap = bytes_per_hap;
+
+        parallel_for(0, n_haps, nthreads, [=](int hap) {
+            uint8_t* hap_ptr = data_ptr + (size_t)hap * local_bytes_per_hap;
             const int hap_byte = hap >> 3;
             const int hap_bit = hap & 7;
 
-            for (int site = 0; site < n_sites; ++site) {
+            for (int site = 0; site < local_n_sites; ++site) {
                 // Get bit from site-major
-                const uint8_t* site_ptr = site_major.data() + (size_t)site * dense_stride;
+                const uint8_t* site_ptr = src_ptr + (size_t)site * dense_stride;
                 uint8_t bit = (site_ptr[hap_byte] >> hap_bit) & 1;
                 // Set bit in haplotype-major
                 if (bit) {
                     hap_ptr[site >> 3] |= (1 << (site & 7));
                 }
             }
-        }
+        });
     }
 
     // Get allele for haplotype h at site s
@@ -1417,7 +1462,8 @@ void processSeedBatch(
     const std::vector<double>& genPos,
     const HapMetadata& meta,
     const HapMajorData& hap_major,
-    double MIN_MATCH_CM,
+    double MIN_SEED_CM,
+    double MIN_OUTPUT_CM,
     double MAX_GAP,
     int MIN_MARKERS,
     double MIN_EXTEND,
@@ -1427,7 +1473,7 @@ void processSeedBatch(
     char line_buffer[256];  // Thread-local line buffer
 
     // Precompute mM1 once for all seeds in batch (avoids repeated floor/division)
-    const int mM1 = static_cast<int>(std::floor((MIN_EXTEND / MIN_MATCH_CM) * MIN_MARKERS)) - 1;
+    const int mM1 = static_cast<int>(std::floor((MIN_EXTEND / MIN_SEED_CM) * MIN_MARKERS)) - 1;
 
     for (const Seed& seed : seeds) {
         int hap1 = seed.hap1;
@@ -1438,12 +1484,12 @@ void processSeedBatch(
         // Extend backwards using fast 64-bit scan first, then gap-tolerant extension
         int prevStart = hap_major.extendMatchBackward64(hap1, hap2, ext_start);
         int nStart = nextStartHapMajor(hap1, hap2, prevStart, genPos, meta, hap_major,
-                              MIN_MATCH_CM, MAX_GAP, MIN_MARKERS, MIN_EXTEND, mM1);
+                              MIN_SEED_CM, MAX_GAP, MIN_MARKERS, MIN_EXTEND, mM1);
 
         while (nStart >= 0 && nStart < prevStart) {
             prevStart = nStart;
             nStart = nextStartHapMajor(hap1, hap2, prevStart, genPos, meta, hap_major,
-                              MIN_MATCH_CM, MAX_GAP, MIN_MARKERS, MIN_EXTEND, mM1);
+                              MIN_SEED_CM, MAX_GAP, MIN_MARKERS, MIN_EXTEND, mM1);
         }
 
         if (nStart >= 0) {
@@ -1451,16 +1497,16 @@ void processSeedBatch(
             int inclEnd = hap_major.extendMatchForward64(hap1, hap2, ext_end, LastMarker);
             int prevInclEnd = inclEnd;
             int nextInclEnd = nextEndHapMajor(hap1, hap2, prevInclEnd, genPos, meta, hap_major,
-                                      MIN_MATCH_CM, MAX_GAP, MIN_MARKERS, MIN_EXTEND, LastMarker, mM1);
+                                      MIN_SEED_CM, MAX_GAP, MIN_MARKERS, MIN_EXTEND, LastMarker, mM1);
             while (nextInclEnd > prevInclEnd) {
                 prevInclEnd = nextInclEnd;
                 nextInclEnd = nextEndHapMajor(hap1, hap2, prevInclEnd, genPos, meta, hap_major,
-                                      MIN_MATCH_CM, MAX_GAP, MIN_MARKERS, MIN_EXTEND, LastMarker, mM1);
+                                      MIN_SEED_CM, MAX_GAP, MIN_MARKERS, MIN_EXTEND, LastMarker, mM1);
             }
 
-            // Write segment to buffer with deduplication
+            // Write segment to buffer with deduplication (use MIN_OUTPUT_CM for final filtering)
             double length_cm = genPos[nextInclEnd] - genPos[nStart];
-            if (length_cm >= MIN_MATCH_CM && (hap1 >> 1) != (hap2 >> 1)) {
+            if (length_cm >= MIN_OUTPUT_CM && (hap1 >> 1) != (hap2 >> 1)) {
                 // Normalize haplotype order for consistent dedup across windows
                 // (PBWT order differs between windows, so same pair might be (5,10) vs (10,5))
                 // Use full haplotype IDs, not sample IDs, to distinguish different hap pairs
@@ -1500,7 +1546,8 @@ void runWindowThread(
     const HapData& hap_data,
     const HapMajorData& hap_major,  // Haplotype-major for cache-friendly extension
     const std::vector<double>& genPos,
-    double MIN_MATCH_CM,
+    double MIN_SEED_CM,
+    double MIN_OUTPUT_CM,
     double MAX_GAP,
     int MIN_MARKERS,
     double MIN_EXTEND,
@@ -1533,8 +1580,8 @@ void runWindowThread(
     std::vector<Seed> seedList;
     seedList.reserve(SEED_LIST_THRESHOLD);
 
-    // Warm-up: advance PBWT without collecting seeds until MIN_MATCH_CM distance
-    double target_cm = genPos[start_site] + MIN_MATCH_CM;
+    // Warm-up: advance PBWT without collecting seeds until MIN_SEED_CM distance
+    double target_cm = genPos[start_site] + MIN_SEED_CM;
     int collection_start = start_site;
 
     while (collection_start <= end_site && genPos[collection_start] < target_cm) {
@@ -1575,7 +1622,7 @@ void runWindowThread(
 
         // Update maxIbsStart to ensure minimum seed length
         while (maxIbsStart + 1 < site_idx &&
-               genPos[site_idx] - genPos[maxIbsStart + 1] >= MIN_MATCH_CM &&
+               genPos[site_idx] - genPos[maxIbsStart + 1] >= MIN_SEED_CM &&
                site_idx - maxIbsStart >= MIN_MARKERS) {
             maxIbsStart++;
         }
@@ -1584,7 +1631,7 @@ void runWindowThread(
         auto t1 = std::chrono::high_resolution_clock::now();
         get_site(site_idx, meta, hap_data, site_buffer);
         collectSeeds(st, site_idx, seedList, meta, hap_data, hap_major, genPos,
-                    MIN_MATCH_CM, MIN_MARKERS, maxIbsStart, start_site, collection_start, end_site,
+                    MIN_SEED_CM, MIN_MARKERS, maxIbsStart, start_site, collection_start, end_site,
                     isLastWindow);
         auto t2 = std::chrono::high_resolution_clock::now();
         local_collect_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(t2 - t1).count();
@@ -1613,7 +1660,7 @@ void runWindowThread(
                 // Not using queue OR queue full - process inline
                 // (If offer failed, to_flush still contains data since move only happens on success)
                 auto te1 = std::chrono::high_resolution_clock::now();
-                processSeedBatch(to_flush, genPos, meta, hap_major, MIN_MATCH_CM,
+                processSeedBatch(to_flush, genPos, meta, hap_major, MIN_SEED_CM, MIN_OUTPUT_CM,
                                MAX_GAP, MIN_MARKERS, MIN_EXTEND, LastMarker,
                                output_buffer);
                 auto te2 = std::chrono::high_resolution_clock::now();
@@ -1628,7 +1675,7 @@ void runWindowThread(
     // Process remaining seeds
     if (!seedList.empty()) {
         auto te1 = std::chrono::high_resolution_clock::now();
-        processSeedBatch(seedList, genPos, meta, hap_major, MIN_MATCH_CM,
+        processSeedBatch(seedList, genPos, meta, hap_major, MIN_SEED_CM, MIN_OUTPUT_CM,
                         MAX_GAP, MIN_MARKERS, MIN_EXTEND, LastMarker,
                         output_buffer);
         auto te2 = std::chrono::high_resolution_clock::now();
@@ -1650,7 +1697,7 @@ void runWindowThread(
     std::vector<Seed> batch;
     while (finished_count.load() < n_windows || !seedQ.empty()) {
         if (seedQ.poll(batch)) {
-            processSeedBatch(batch, genPos, meta, hap_major, MIN_MATCH_CM,
+            processSeedBatch(batch, genPos, meta, hap_major, MIN_SEED_CM, MIN_OUTPUT_CM,
                            MAX_GAP, MIN_MARKERS, MIN_EXTEND, LastMarker,
                            output_buffer);
         }
@@ -1704,9 +1751,6 @@ int main(int argc, char** argv) {
     // Pass thread count to P-smoother for parallel processing
     ps_params.nthreads = nthreads;
     ps_params.verbose = false;  // Disable detailed P-smoother output
-
-    // Set OpenMP thread limit to match --threads parameter
-    omp_set_num_threads(nthreads);
 
     std::cerr << "[INFO] Using " << nthreads << " thread(s)\n";
     std::cerr << "[INFO] min-output=" << min_output << " cM\n";
@@ -1785,10 +1829,10 @@ int main(int argc, char** argv) {
     }
 
     // Recompute MAC (needed for minMac filter)
-    recompute_mac(hap_2d, meta);
+    recompute_mac(hap_2d, meta, nthreads);
 
     // Pack to bit-packed format (applies minMac filter)
-    pack_haplotypes(hap_2d, hap_data, meta, minMac);
+    pack_haplotypes(hap_2d, hap_data, meta, minMac, nthreads);
 
     // Free 2D data (no longer needed after packing)
     hap_2d.clear();
@@ -1799,17 +1843,18 @@ int main(int argc, char** argv) {
 
     // Create haplotype-major layout for cache-friendly extension
     HapMajorData hap_major;
-    hap_major.transpose(meta, hap_data);
+    hap_major.transpose(meta, hap_data, nthreads);
 
     // Read genetic map and interpolate positions
     GeneticMap gmap = readGeneticMap(map_path);
     std::vector<int> vcf_bp = meta.vcf_bp_positions;
     std::vector<double> genPos = interpolateGeneticPositions(gmap, vcf_bp);
 
-    // Parameters (min_output defaults to 2.0 if not specified by user)
-    double MIN_MATCH_CM = min_output;
+    // Parameters
+    double MIN_SEED_CM = 2.0;    // Minimum cM for seed collection (fixed, matches HapIBD default)
+    double MIN_OUTPUT_CM = min_output;  // Minimum cM for output filtering (user-configurable)
     double MAX_GAP = 1000;
-    double MIN_EXTEND = std::min(1.0, MIN_MATCH_CM);
+    double MIN_EXTEND = std::min(1.0, MIN_SEED_CM);
     int MIN_MARKERS = 100;
     int LastMarker = n_sites - 1;
 
@@ -1841,7 +1886,7 @@ int main(int argc, char** argv) {
         char line_buffer[256];  // For formatted output
 
         // Precompute mM1 once (avoids repeated floor/division in hot loop)
-        const int mM1 = static_cast<int>(std::floor((MIN_EXTEND / MIN_MATCH_CM) * MIN_MARKERS)) - 1;
+        const int mM1 = static_cast<int>(std::floor((MIN_EXTEND / MIN_SEED_CM) * MIN_MARKERS)) - 1;
 
         // Lambda to process and extend a batch of seeds using haplotype-major layout
         auto processBatch = [&]() {
@@ -1854,12 +1899,12 @@ int main(int argc, char** argv) {
                 // Extend backwards using fast 64-bit scan first, then gap-tolerant extension
                 int prevStart = hap_major.extendMatchBackward64(hap1, hap2, ext_start);
                 int nStart = nextStartHapMajor(hap1, hap2, prevStart, genPos, meta, hap_major,
-                                       MIN_MATCH_CM, MAX_GAP, MIN_MARKERS, MIN_EXTEND, mM1);
+                                       MIN_SEED_CM, MAX_GAP, MIN_MARKERS, MIN_EXTEND, mM1);
 
                 while (nStart >= 0 && nStart < prevStart) {
                     prevStart = nStart;
                     nStart = nextStartHapMajor(hap1, hap2, prevStart, genPos, meta, hap_major,
-                                       MIN_MATCH_CM, MAX_GAP, MIN_MARKERS, MIN_EXTEND, mM1);
+                                       MIN_SEED_CM, MAX_GAP, MIN_MARKERS, MIN_EXTEND, mM1);
                 }
 
                 if (nStart >= 0) {
@@ -1867,16 +1912,16 @@ int main(int argc, char** argv) {
                     int inclEnd = hap_major.extendMatchForward64(hap1, hap2, ext_end, LastMarker);
                     int prevInclEnd = inclEnd;
                     int nextInclEnd = nextEndHapMajor(hap1, hap2, prevInclEnd, genPos, meta, hap_major,
-                                              MIN_MATCH_CM, MAX_GAP, MIN_MARKERS, MIN_EXTEND, LastMarker, mM1);
+                                              MIN_SEED_CM, MAX_GAP, MIN_MARKERS, MIN_EXTEND, LastMarker, mM1);
                     while (nextInclEnd > prevInclEnd) {
                         prevInclEnd = nextInclEnd;
                         nextInclEnd = nextEndHapMajor(hap1, hap2, prevInclEnd, genPos, meta, hap_major,
-                                              MIN_MATCH_CM, MAX_GAP, MIN_MARKERS, MIN_EXTEND, LastMarker, mM1);
+                                              MIN_SEED_CM, MAX_GAP, MIN_MARKERS, MIN_EXTEND, LastMarker, mM1);
                     }
 
-                    // Write segment to file
+                    // Write segment to file (use MIN_OUTPUT_CM for final filtering)
                     double length_cm = genPos[nextInclEnd] - genPos[nStart];
-                    if (length_cm >= MIN_MATCH_CM && (hap1 >> 1) != (hap2 >> 1)) {
+                    if (length_cm >= MIN_OUTPUT_CM && (hap1 >> 1) != (hap2 >> 1)) {
                         int len = snprintf(line_buffer, sizeof(line_buffer),
                                           "%d\t%d\t%d\t%d\t%d\t%d\t%.6f\n",
                                           hap1 / 2, hap1 & 1, hap2 / 2, hap2 & 1,
@@ -1894,7 +1939,7 @@ int main(int argc, char** argv) {
         // Simple single-threaded loop
         for (int32_t site_idx = 0; site_idx < n_sites; ++site_idx) {
             get_site(site_idx, meta, hap_data, site_buffer);
-            collectSeedsSimple(st, site_idx, LastMarker, seeds, meta, hap_data, hap_major, genPos, MIN_MATCH_CM, MIN_MARKERS);
+            collectSeedsSimple(st, site_idx, LastMarker, seeds, meta, hap_data, hap_major, genPos, MIN_SEED_CM, MIN_MARKERS);
             pbwt_step(site_idx, site_buffer, st);
 
             // Process batch when threshold reached (improves cache locality)
@@ -1923,7 +1968,7 @@ int main(int argc, char** argv) {
     } else {
         // Parallel path (nthreads > 1)
         // Create windows
-        std::vector<Window> windows = createOverlappingWindows(genPos, MIN_MATCH_CM, MIN_MARKERS, nthreads);
+        std::vector<Window> windows = createOverlappingWindows(genPos, MIN_SEED_CM, MIN_MARKERS, nthreads);
 
         // Striped deduplication for reduced mutex contention with multiple threads
         StripedDedup dedup;
@@ -1935,15 +1980,16 @@ int main(int argc, char** argv) {
         // Use actual number of windows created (may be less than requested)
         int actual_threads = static_cast<int>(windows.size());
 
-        // Launch threads and pin each to a separate core
+        // Launch worker threads for windows 0 to actual_threads-2
+        // Main thread will handle the last window
         std::vector<std::thread> threads;
-        for (int w = 0; w < actual_threads; ++w) {
-            bool isLastWindow = (w == actual_threads - 1);  // Only last window does close-out
+        for (int w = 0; w < actual_threads - 1; ++w) {
+            bool isLastWindow = false;
             threads.emplace_back(runWindowThread,
                                w, windows[w].start_site, windows[w].end_site,
                                std::cref(meta), std::cref(hap_data), std::cref(hap_major),
                                std::cref(genPos),
-                               MIN_MATCH_CM, MAX_GAP, MIN_MARKERS, MIN_EXTEND, LastMarker,
+                               MIN_SEED_CM, MIN_OUTPUT_CM, MAX_GAP, MIN_MARKERS, MIN_EXTEND, LastMarker,
                                std::ref(seedQ), std::ref(finished_count), actual_threads,
                                output_file, std::ref(file_mtx), std::ref(segment_count),
                                std::ref(dedup),
@@ -1953,7 +1999,20 @@ int main(int argc, char** argv) {
             pinThreadToCore(threads.back(), w);
         }
 
-        // Wait for all threads to complete
+        // Main thread handles the last window
+        int last_w = actual_threads - 1;
+        runWindowThread(
+            last_w, windows[last_w].start_site, windows[last_w].end_site,
+            std::cref(meta), std::cref(hap_data), std::cref(hap_major),
+            std::cref(genPos),
+            MIN_SEED_CM, MIN_OUTPUT_CM, MAX_GAP, MIN_MARKERS, MIN_EXTEND, LastMarker,
+            std::ref(seedQ), std::ref(finished_count), actual_threads,
+            output_file, std::ref(file_mtx), std::ref(segment_count),
+            std::ref(dedup),
+            true,  // isLastWindow
+            std::ref(timing));
+
+        // Wait for worker threads to complete
         for (auto& t : threads) {
             t.join();
         }

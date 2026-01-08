@@ -270,9 +270,10 @@ void PSmoother::runReversePBWT(const std::vector<std::vector<uint8_t>>& hap_data
             store_end[w] = max(0, min(store_end[w], N - 1));
         }
 
-        // Launch threads
+        // Launch worker threads for windows 0 to actual_threads-2
+        // Main thread will handle the last window
         vector<thread> threads;
-        for (int w = 0; w < actual_threads; ++w) {
+        for (int w = 0; w < actual_threads - 1; ++w) {
             threads.emplace_back(runReverseWindowThread,
                                w, cref(windows[w]),
                                cref(hap_data),
@@ -282,7 +283,17 @@ void PSmoother::runReversePBWT(const std::vector<std::vector<uint8_t>>& hap_data
                                params.verbose);
         }
 
-        // Wait for all threads
+        // Main thread handles the last window
+        int last_w = actual_threads - 1;
+        runReverseWindowThread(
+            last_w, cref(windows[last_w]),
+            cref(hap_data),
+            ref(reverse_pre), ref(reverse_div),
+            M, N,
+            store_start[last_w], store_end[last_w],
+            params.verbose);
+
+        // Wait for worker threads
         for (auto& t : threads) {
             t.join();
         }

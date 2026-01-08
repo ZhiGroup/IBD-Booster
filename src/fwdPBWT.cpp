@@ -593,8 +593,10 @@ void PSmoother::runForwardPBWT(std::vector<std::vector<uint8_t>>& hap_data) {
         atomic<int> total_corrections(0);
         atomic<int> total_blocks(0);
 
+        // Launch worker threads for windows 0 to actual_threads-2
+        // Main thread will handle the last window
         vector<thread> threads;
-        for (int w = 0; w < actual_threads; ++w) {
+        for (int w = 0; w < actual_threads - 1; ++w) {
             threads.emplace_back(runForwardWindowThread,
                                w, cref(windows[w]),
                                ref(hap_data),
@@ -605,6 +607,18 @@ void PSmoother::runForwardPBWT(std::vector<std::vector<uint8_t>>& hap_data) {
                                params.verbose);
         }
 
+        // Main thread handles the last window
+        int last_w = actual_threads - 1;
+        runForwardWindowThread(
+            last_w, cref(windows[last_w]),
+            ref(hap_data),
+            cref(reverse_pre), cref(reverse_div),
+            M, N, L, G,
+            params.width, params.rho,
+            ref(total_corrections), ref(total_blocks),
+            params.verbose);
+
+        // Wait for worker threads
         for (auto& t : threads) {
             t.join();
         }

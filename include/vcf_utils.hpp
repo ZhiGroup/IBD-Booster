@@ -214,7 +214,8 @@ HapMetadata read_vcf_to_2d(
 // Must be called before pack_haplotypes to ensure filtering uses post-smoothed counts
 void recompute_mac(
     const std::vector<std::vector<uint8_t>>& hap_2d,
-    HapMetadata& meta);
+    HapMetadata& meta,
+    int nthreads = 1);
 
 // Pack 2D vector to bit-packed HapData format (after P-smoother)
 // Applies minMac filter during packing - only sites with MAC >= minMac are kept
@@ -223,7 +224,8 @@ void pack_haplotypes(
     const std::vector<std::vector<uint8_t>>& hap_2d,
     HapData& hap_data,
     HapMetadata& meta,
-    int minMac);
+    int minMac,
+    int nthreads = 1);
 
 // Write smoothed haplotypes to VCF (preserves original header and variant info)
 void write_smoothed_vcf(

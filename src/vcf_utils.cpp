@@ -10,7 +10,49 @@
 #include <cstdio>
 #include <iostream>
 #include <algorithm>
-#include <omp.h>
+#include <thread>
+
+// Simple parallel_for using std::thread (replaces OpenMP to avoid thread pool conflicts)
+// Main thread participates in work to use exactly nthreads total
+template<typename Func>
+static void parallel_for(int start, int end, int nthreads, Func&& func) {
+    if (nthreads <= 1 || end - start <= 1) {
+        for (int i = start; i < end; ++i) {
+            func(i);
+        }
+        return;
+    }
+
+    int range = end - start;
+    int chunk = (range + nthreads - 1) / nthreads;
+    std::vector<std::thread> threads;
+    threads.reserve(nthreads - 1);  // Main thread handles one chunk
+
+    // Spawn nthreads-1 worker threads for chunks 0 to nthreads-2
+    for (int t = 0; t < nthreads - 1; ++t) {
+        int t_start = start + t * chunk;
+        int t_end = std::min(t_start + chunk, end);
+        if (t_start >= end) break;
+
+        threads.emplace_back([t_start, t_end, &func]() {
+            for (int i = t_start; i < t_end; ++i) {
+                func(i);
+            }
+        });
+    }
+
+    // Main thread handles the last chunk
+    int main_start = start + (nthreads - 1) * chunk;
+    int main_end = end;
+    for (int i = main_start; i < main_end; ++i) {
+        func(i);
+    }
+
+    // Join worker threads
+    for (auto& th : threads) {
+        th.join();
+    }
+}
 
 
 HapMetadata read_vcf(const std::string& vcf_file,
@@ -434,7 +476,8 @@ HapMetadata read_vcf_to_2d(
 // This ensures filtering uses post-smoothed allele counts
 void recompute_mac(
     const std::vector<std::vector<uint8_t>>& hap_2d,
-    HapMetadata& meta)
+    HapMetadata& meta,
+    int nthreads)
 {
     int n_sites = static_cast<int>(hap_2d.size());
     int n_haps = meta.n_haps;
@@ -446,22 +489,22 @@ void recompute_mac(
 
     meta.site_mac.resize(n_sites);
 
-    #pragma omp parallel for schedule(static)
-    for (int site = 0; site < n_sites; ++site) {
+    parallel_for(0, n_sites, nthreads, [&](int site) {
         int alt_count = 0;
         for (int h = 0; h < n_haps; ++h) {
             if (hap_2d[site][h] != 0) ++alt_count;
         }
         int ref_count = n_haps - alt_count;
         meta.site_mac[site] = std::min(ref_count, alt_count);
-    }
+    });
 }
 
 void pack_haplotypes(
     const std::vector<std::vector<uint8_t>>& hap_2d,
     HapData& hap_data,
     HapMetadata& meta,
-    int minMac)
+    int minMac,
+    int nthreads)
 {
     int n_sites_all = meta.n_sites;
     int n_haps = meta.n_haps;
@@ -505,8 +548,7 @@ void pack_haplotypes(
     hap_data.resize(total_size, 0);
 
     // Step 5: Pack filtered sites in parallel
-    #pragma omp parallel for schedule(dynamic, 64)
-    for (int i = 0; i < n_sites_filtered; ++i) {
+    parallel_for(0, n_sites_filtered, nthreads, [&](int i) {
         int orig_site = filtered_indices[i];
         SiteType stype = meta.site_types[i];
         if (stype == SiteType::DENSE || stype == SiteType::SPARSE) {
@@ -518,7 +560,7 @@ void pack_haplotypes(
                 }
             }
         }
-    }
+    });
 }
 
 // Write smoothed haplotypes to VCF - OPTIMIZED VERSION

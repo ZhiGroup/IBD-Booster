@@ -61,9 +61,3 @@ IBD-Booster uses the Positional Burrows-Wheeler Transform (PBWT) algorithm for e
 3. **PBWT Seed Collection**: Identify candidate IBD segments using divergence arrays
 4. **Seed Extension**: Extend seeds bidirectionally with gap tolerance
 5. **Output**: Write detected IBD segments
-
-## Performance
-
-- Optimized with SIMD (AVX2/AVX-512) for fast haplotype comparison
-- Multi-threaded windowed processing with overlapping windows
-- Haplotype-major data layout for cache-efficient extension
