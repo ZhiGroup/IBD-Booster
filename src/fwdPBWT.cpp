@@ -8,15 +8,15 @@
  * Key concepts:
  *   - Link array: Each haplotype has (hap_id, fwd_block, rev_block)
  *   - Radix sort by (fwd_block, rev_block) groups haplotypes into IBS blocks
- *   - Within each block, minority alleles are corrected to majority
+ *   - Within each block, minority alleles are corrected to the majority
  *   - Circular gap buffer delays output to allow accumulated corrections
  *
  * Parallelization:
  *   - Chromosome is divided into overlapping windows
- *   - Each window has a warmup phase (to build PBWT state) and active phase
+ *   - Each window has a warmup phase (to build PBWT state) and an active phase
  *   - Only the active phase produces output; warmup establishes correct state
  *
- * Based on P-smoother by Degui Zhi and Shaojie Zhang.
+ * 
  */
 
 #include "psmoother.hpp"
