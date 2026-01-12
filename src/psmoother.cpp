@@ -1,6 +1,17 @@
-// P-smoother main class implementation
-// Based on P-smoother by Degui Zhi and Shaojie Zhang
-// Modified for in-memory operation with cpp-HapIBD
+/**
+ * P-Smoother Main Class Implementation
+ * 
+ * Based on P-smoother: efficient PBWT smoothing of large haplotype panels
+ *   Yue W., Naseri A., Wang V., Shakya P., Zhang S., Zhi D.
+ *   Bioinformatics Advances, 2022, Volume 2, Issue 1, vbac045
+ *   https://doi.org/10.1093/bioadv/vbac045
+ *   GitHub: https://github.com/ZhiGroup/P-smoother
+ * 
+ * Description:
+ *   Adapted for in-memory operation with cpp-HapIBD, this class provides 
+ *   efficient PBWT-based smoothing of large haplotype panels for downstream analyses
+ *   such as identity-by-descent (IBD) detection.
+ */
 
 #include "psmoother.hpp"
 #include <iostream>
@@ -47,3 +58,4 @@ int PSmoother::smooth(std::vector<std::vector<uint8_t>>& hap_data) {
 
     return corrections_count;
 }
+
