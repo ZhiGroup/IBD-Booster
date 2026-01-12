@@ -18,8 +18,6 @@
  *   - Seed merging to eliminate redundant extension work
  *   - Striped deduplication for thread-safe segment output
  *
- * Based on hap-IBD algorithm by Browning & Browning.
- * P-smoother based on work by Degui Zhi and Shaojie Zhang.
  */
 
 #include "../include/pbwt.hpp"
