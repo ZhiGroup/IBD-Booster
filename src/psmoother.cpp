@@ -8,7 +8,7 @@
  *   GitHub: https://github.com/ZhiGroup/P-smoother
  * 
  * Description:
- *   Adapted for in-memory operation with cpp-HapIBD, this class provides 
+ *   Adapted for in-memory operation with the IBD caller, this class provides 
  *   efficient PBWT-based smoothing of large haplotype panels for downstream analyses
  *   such as identity-by-descent (IBD) detection.
  */
@@ -58,4 +58,5 @@ int PSmoother::smooth(std::vector<std::vector<uint8_t>>& hap_data) {
 
     return corrections_count;
 }
+
 
