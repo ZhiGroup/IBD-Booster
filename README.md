@@ -1,6 +1,6 @@
 # IBD-Booster
+Fast IBD segment detection from phased VCF files using PBWT, with P-smoother for error correction and a C++ implementation of hap-IBD for IBD calling.
 
-Fast IBD segment detection from phased VCF files using PBWT with integrated P-smoother error correction.
 
 ## Building
 
@@ -60,4 +60,5 @@ IBD-Booster uses the Positional Burrows-Wheeler Transform (PBWT) algorithm for e
 2. **P-smoother**: Correct phasing errors using PBWT-based error detection (optional)
 3. **PBWT Seed Collection**: Identify candidate IBD segments using divergence arrays
 4. **Seed Extension**: Extend seeds bidirectionally with gap tolerance
+
 5. **Output**: Write detected IBD segments
