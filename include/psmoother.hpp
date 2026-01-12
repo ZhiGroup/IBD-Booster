@@ -1,7 +1,6 @@
 /**
  * P-smoother: Haplotype Error Correction using Bidirectional PBWT
  *
- * Based on the P-smoother algorithm by Degui Zhi and Shaojie Zhang.
  * Modified for in-memory operation with IBD-Booster.
  *
  * Algorithm:
@@ -77,3 +76,4 @@ private:
 };
 
 #endif // PSMOOTHER_HPP
+
