@@ -1,5 +1,6 @@
 # IBD-Booster
-Fast IBD segment detection from phased VCF files using PBWT, integrating P-smoother error correction and seed-and-extend IBD calling following Browning et al. (hap-IBD), implemented in C++.
+Fast IBD segment detection from phased VCF files using PBWT, integrating P-smoother error correction and seed-and-extend IBD calling following Browning et al. (hap-IBD), implemented in C++. IBD-Booster uses the positional Burrows-Wheeler transform (PBWT) algorithm for efficient IBD detection.
+
 ## Building
 
 ```bash
@@ -50,15 +51,6 @@ This indicates:
 - Sample 0 haplotype 0 shares IBD with Sample 1 haplotype 1 from bp 10000-50000 (2.5 cM)
 - Sample 0 haplotype 1 shares IBD with Sample 2 haplotype 0 from bp 15000-75000 (3.2 cM)
 
-## Algorithm
 
-IBD-Booster uses the Positional Burrows-Wheeler Transform (PBWT) algorithm for efficient IBD detection:
-
-1. **VCF Reading**: Load phased haplotypes from VCF/VCF.gz
-2. **P-smoother**: Correct phasing errors using PBWT-based error detection (optional)
-3. **PBWT Seed Collection**: Identify candidate IBD segments using divergence arrays
-4. **Seed Extension**: Extend seeds bidirectionally with gap tolerance
-
-5. **Output**: Write detected IBD segments
 
 
