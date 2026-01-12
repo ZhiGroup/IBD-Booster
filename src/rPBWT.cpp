@@ -9,14 +9,13 @@
  * The reverse PBWT is conceptually identical to the forward PBWT,
  * but processes sites in reverse order. This gives us divergence
  * values that indicate how far back (towards the end of the chromosome)
- * each pair of adjacent haplotypes match.
+ * each pair of adjacent haplotypes matches.
  *
  * Combined with forward divergence, we can identify contiguous IBS
  * blocks that span multiple sites in both directions.
  *
  * Parallelization uses overlapping windows similar to the forward pass.
  *
- * Based on P-smoother by Degui Zhi and Shaojie Zhang.
  */
 
 #include "psmoother.hpp"
