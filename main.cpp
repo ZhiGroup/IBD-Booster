@@ -23,6 +23,8 @@
 #include "../include/pbwt.hpp"
 #include "../include/vcf_utils.hpp"
 #include "../include/psmoother.hpp"
+#include "../include/feature_extractor.hpp"
+#include "../include/xgb_predictor.hpp"
 #include <iostream>
 #include <fstream>
 #include <vector>
@@ -46,6 +48,7 @@
 #ifdef __linux__
 #include <pthread.h>
 #include <sched.h>
+#include <sys/mman.h>  // For madvise() huge page hints
 #elif defined(_WIN32)
 #include <windows.h>
 #endif
@@ -135,154 +138,48 @@ struct Seed {
 };
 
 // Haplotype-major data layout for cache-friendly extension
-// Instead of site-major (all haps for site 0, all haps for site 1, ...),
-// store haplotype-major (all sites for hap 0, all sites for hap 1, ...)
-// This dramatically improves cache locality during extension.
-struct HapMajorData {
-    std::vector<uint8_t> data;  // Packed bits: hap-major layout
-    int n_haps;
-    int n_sites;
-    int bytes_per_hap;  // (n_sites + 7) / 8
+// HapMajorData is defined in vcf_utils.hpp
+// This function transposes site-major to haplotype-major layout (parallelized)
+void transposeToHapMajor(HapMajorData& hap_major, const HapMetadata& meta,
+                         const HapData& site_major, int nthreads = 1) {
+    hap_major.n_haps = meta.n_haps;
+    hap_major.n_sites = meta.n_sites;
+    hap_major.bytes_per_hap = (meta.n_sites + 7) / 8;
+    const int dense_stride = meta.dense_stride;
 
-    // Transpose from site-major to haplotype-major
-    // Parallelized by haplotype (each haplotype writes to its own memory region - no race)
-    void transpose(const HapMetadata& meta, const HapData& site_major, int nthreads = 1) {
-        n_haps = meta.n_haps;
-        n_sites = meta.n_sites;
-        bytes_per_hap = (n_sites + 7) / 8;
-        const int dense_stride = meta.dense_stride;
+    // Allocate haplotype-major storage
+    hap_major.data.resize((size_t)hap_major.n_haps * hap_major.bytes_per_hap, 0);
 
-        // Allocate haplotype-major storage
-        data.resize((size_t)n_haps * bytes_per_hap, 0);
+    // Request huge pages for this large allocation (2GB+ array)
+    // Works when THP is set to 'madvise' or 'always' - no sudo required
+    // Reduces TLB misses: 500K page table entries (4KB) -> 1K entries (2MB)
+#ifdef __linux__
+    madvise(hap_major.data.data(), hap_major.data.size(), MADV_HUGEPAGE);
+#endif
 
-        // Transpose: for each haplotype, gather bits from all sites
-        // Parallelized by haplotype - each writes to different memory region (no race)
-        uint8_t* data_ptr = data.data();
-        const uint8_t* src_ptr = site_major.data();
-        const int local_n_sites = n_sites;
-        const int local_bytes_per_hap = bytes_per_hap;
+    // Transpose: for each haplotype, gather bits from all sites
+    // Parallelized by haplotype - each writes to different memory region (no race)
+    uint8_t* data_ptr = hap_major.data.data();
+    const uint8_t* src_ptr = site_major.data();
+    const int local_n_sites = hap_major.n_sites;
+    const int local_bytes_per_hap = hap_major.bytes_per_hap;
 
-        parallel_for(0, n_haps, nthreads, [=](int hap) {
-            uint8_t* hap_ptr = data_ptr + (size_t)hap * local_bytes_per_hap;
-            const int hap_byte = hap >> 3;
-            const int hap_bit = hap & 7;
+    parallel_for(0, hap_major.n_haps, nthreads, [=](int hap) {
+        uint8_t* hap_ptr = data_ptr + (size_t)hap * local_bytes_per_hap;
+        const int hap_byte = hap >> 3;
+        const int hap_bit = hap & 7;
 
-            for (int site = 0; site < local_n_sites; ++site) {
-                // Get bit from site-major
-                const uint8_t* site_ptr = src_ptr + (size_t)site * dense_stride;
-                uint8_t bit = (site_ptr[hap_byte] >> hap_bit) & 1;
-                // Set bit in haplotype-major
-                if (bit) {
-                    hap_ptr[site >> 3] |= (1 << (site & 7));
-                }
+        for (int site = 0; site < local_n_sites; ++site) {
+            // Get bit from site-major
+            const uint8_t* site_ptr = src_ptr + (size_t)site * dense_stride;
+            uint8_t bit = (site_ptr[hap_byte] >> hap_bit) & 1;
+            // Set bit in haplotype-major
+            if (bit) {
+                hap_ptr[site >> 3] |= (1 << (site & 7));
             }
-        });
-    }
-
-    // Get allele for haplotype h at site s
-    inline uint8_t get(int hap, int site) const {
-        return (data[(size_t)hap * bytes_per_hap + (site >> 3)] >> (site & 7)) & 1;
-    }
-
-    // Fast check if two haplotypes match at a site (XOR-based, single comparison)
-    inline bool allelesMatch(int hap1, int hap2, int site) const {
-        const int byte_idx = site >> 3;
-        const int bit_idx = site & 7;
-        return !((data[(size_t)hap1 * bytes_per_hap + byte_idx] ^
-                  data[(size_t)hap2 * bytes_per_hap + byte_idx]) >> bit_idx & 1);
-    }
-
-    // Get pointer to haplotype's data (for block operations)
-    inline const uint8_t* hapPtr(int hap) const {
-        return data.data() + (size_t)hap * bytes_per_hap;
-    }
-
-    // Fast 64-bit backward scan to find first mismatch position (scanning backwards)
-    // Returns the first matching position (inclusive), or 0 if matches to beginning
-    // Much faster than bit-by-bit allelesMatch() loop
-    inline int extendMatchBackward64(int hap1, int hap2, int start) const {
-        if (start <= 0) return start;
-
-        const uint8_t* __restrict h1_ptr = data.data() + (size_t)hap1 * bytes_per_hap;
-        const uint8_t* __restrict h2_ptr = data.data() + (size_t)hap2 * bytes_per_hap;
-
-        int m = start - 1;
-
-        // 64-bit word scanning backwards: skip 64 matching sites at once when byte-aligned
-        while (m >= 63) {
-            int word_start_byte = (m - 63) >> 3;
-            if (((m - 63) & 7) == 0) {  // Byte-aligned
-                uint64_t w1, w2;
-                memcpy(&w1, h1_ptr + word_start_byte, 8);
-                memcpy(&w2, h2_ptr + word_start_byte, 8);
-                uint64_t xor_word = w1 ^ w2;
-                if (xor_word == 0) {
-                    m -= 64;  // Skip 64 matching sites
-                    continue;
-                }
-                // Has mismatches - find highest set bit (last mismatch in this word)
-                int highest_mismatch = 63 - __builtin_clzll(xor_word);
-                return (m - 63) + highest_mismatch + 1;  // Return first matching position after mismatch
-            }
-            break;  // Not aligned, switch to bit-by-bit
         }
-
-        // Bit-by-bit for remaining sites or unaligned start
-        while (m >= 0) {
-            const int byte_idx = m >> 3;
-            const int bit_idx = m & 7;
-            if ((h1_ptr[byte_idx] ^ h2_ptr[byte_idx]) >> bit_idx & 1) {
-                return m + 1;  // Mismatch at m, return m+1 as first match
-            }
-            --m;
-        }
-
-        return 0;  // Matched all the way to beginning
-    }
-
-    // Fast 64-bit forward scan to find first mismatch position
-    // Returns the last matching position (inclusive), or LastMarker if matches to end
-    // Much faster than bit-by-bit allelesMatch() loop
-    inline int extendMatchForward64(int hap1, int hap2, int start, int LastMarker) const {
-        if (start >= LastMarker) return start;
-
-        const uint8_t* __restrict h1_ptr = data.data() + (size_t)hap1 * bytes_per_hap;
-        const uint8_t* __restrict h2_ptr = data.data() + (size_t)hap2 * bytes_per_hap;
-
-        int m = start + 1;
-
-        // 64-bit word scanning: skip 64 matching sites at once when byte-aligned
-        while (m + 64 <= LastMarker) {
-            if ((m & 7) == 0) {  // m is byte-aligned
-                int word_start_byte = m >> 3;
-                uint64_t w1, w2;
-                memcpy(&w1, h1_ptr + word_start_byte, 8);
-                memcpy(&w2, h2_ptr + word_start_byte, 8);
-                uint64_t xor_word = w1 ^ w2;
-                if (xor_word == 0) {
-                    m += 64;  // Skip 64 matching sites
-                    continue;
-                }
-                // Has mismatches - find lowest set bit (first mismatch)
-                int lowest_mismatch = __builtin_ctzll(xor_word);
-                return m + lowest_mismatch - 1;  // Return last matching position
-            }
-            break;  // Not aligned, switch to bit-by-bit
-        }
-
-        // Bit-by-bit for remaining sites or unaligned start
-        while (m <= LastMarker) {
-            const int byte_idx = m >> 3;
-            const int bit_idx = m & 7;
-            if ((h1_ptr[byte_idx] ^ h2_ptr[byte_idx]) >> bit_idx & 1) {
-                return m - 1;  // Mismatch at m, return m-1 as last match
-            }
-            ++m;
-        }
-
-        return LastMarker;  // Matched all the way to end
-    }
-};
+    });
+}
 
 // Merge overlapping seeds for the same haplotype pair
 // This significantly reduces extension work by eliminating redundant seeds
@@ -552,6 +449,310 @@ struct SegmentKeyHash {
     }
 };
 
+/**
+ * BinarySegment: Compact binary format for IBD segments.
+ * Stores site indices directly to avoid bp->site conversion on read.
+ * 28 bytes vs ~45 bytes text, plus no parsing overhead.
+ */
+#pragma pack(push, 1)
+struct BinarySegment {
+    int32_t hap1;       // Combined haplotype index (sample * 2 + hap)
+    int32_t hap2;
+    int32_t start_idx;  // Site index (direct, no bp lookup needed)
+    int32_t end_idx;
+    int32_t start_bp;   // Keep bp for final output
+    int32_t end_bp;
+    float length_cm;
+};
+#pragma pack(pop)
+static_assert(sizeof(BinarySegment) == 28, "BinarySegment must be 28 bytes");
+
+/**
+ * Sort Segments.bin by (hap1, hap2) for cache-friendly feature extraction.
+ * Segments sharing haplotypes will be processed together.
+ *
+ * For files that fit in memory: in-memory sort
+ * For large files: external merge sort (TODO)
+ */
+// Comparator for BinarySegment sorting by (hap1, hap2)
+inline bool segmentLess(const BinarySegment& a, const BinarySegment& b) {
+    if (a.hap1 != b.hap1) return a.hap1 < b.hap1;
+    return a.hap2 < b.hap2;
+}
+
+// Entry for k-way merge heap
+struct MergeEntry {
+    BinarySegment seg;
+    int file_idx;
+    bool operator>(const MergeEntry& other) const {
+        return !segmentLess(seg, other.seg);  // For min-heap
+    }
+};
+
+/**
+ * External merge sort for large binary segment files.
+ * Phase 1: Split into sorted chunks that fit in memory
+ * Phase 2: K-way merge of sorted chunks
+ */
+bool sortBinarySegments(const std::string& input_file, const std::string& output_file,
+                        size_t max_memory_bytes = 4ULL * 1024 * 1024 * 1024) {
+    // Get file size
+    FILE* fin = fopen(input_file.c_str(), "rb");
+    if (!fin) {
+        std::cerr << "[ERROR] Cannot open " << input_file << " for reading\n";
+        return false;
+    }
+    fseek(fin, 0, SEEK_END);
+    long long file_size = ftell(fin);
+    fseek(fin, 0, SEEK_SET);
+
+    size_t n_segments = file_size / sizeof(BinarySegment);
+    std::cerr << "[Sort] " << n_segments << " segments (" << file_size / (1024*1024) << " MB)\n";
+
+    // Calculate chunk size (segments that fit in memory)
+    size_t segments_per_chunk = max_memory_bytes / sizeof(BinarySegment);
+    size_t n_chunks = (n_segments + segments_per_chunk - 1) / segments_per_chunk;
+
+    auto total_start = std::chrono::steady_clock::now();
+
+    if (n_chunks == 1) {
+        // File fits in memory - simple in-memory sort
+        std::vector<BinarySegment> segments(n_segments);
+        size_t read = fread(segments.data(), sizeof(BinarySegment), n_segments, fin);
+        fclose(fin);
+
+        if (read != n_segments) {
+            std::cerr << "[ERROR] Read only " << read << " of " << n_segments << " segments\n";
+            return false;
+        }
+
+        std::cerr << "[Sort] In-memory sort...\n";
+        std::sort(segments.begin(), segments.end(), segmentLess);
+
+        FILE* fout = fopen(output_file.c_str(), "wb");
+        if (!fout) {
+            std::cerr << "[ERROR] Cannot open " << output_file << " for writing\n";
+            return false;
+        }
+        fwrite(segments.data(), sizeof(BinarySegment), n_segments, fout);
+        fclose(fout);
+
+        auto total_end = std::chrono::steady_clock::now();
+        auto total_sec = std::chrono::duration_cast<std::chrono::seconds>(total_end - total_start).count();
+        std::cerr << "[Sort] Completed in " << total_sec << " seconds\n";
+        return true;
+    }
+
+    // ========== EXTERNAL MERGE SORT ==========
+    std::cerr << "[Sort] External sort: " << n_chunks << " chunks of ~"
+              << segments_per_chunk << " segments each\n";
+
+    // Phase 1: Create sorted chunk files
+    std::vector<std::string> chunk_files;
+    std::vector<BinarySegment> chunk_buffer(segments_per_chunk);
+
+    for (size_t chunk_idx = 0; chunk_idx < n_chunks; ++chunk_idx) {
+        size_t remaining = n_segments - chunk_idx * segments_per_chunk;
+        size_t chunk_size = std::min(segments_per_chunk, remaining);
+
+        size_t read = fread(chunk_buffer.data(), sizeof(BinarySegment), chunk_size, fin);
+        if (read != chunk_size) {
+            std::cerr << "[ERROR] Failed to read chunk " << chunk_idx << "\n";
+            fclose(fin);
+            return false;
+        }
+
+        // Sort this chunk
+        std::sort(chunk_buffer.begin(), chunk_buffer.begin() + chunk_size, segmentLess);
+
+        // Write to temp file
+        std::string chunk_file = input_file + ".tmp." + std::to_string(chunk_idx);
+        FILE* fchunk = fopen(chunk_file.c_str(), "wb");
+        if (!fchunk) {
+            std::cerr << "[ERROR] Cannot create temp file " << chunk_file << "\n";
+            fclose(fin);
+            return false;
+        }
+        fwrite(chunk_buffer.data(), sizeof(BinarySegment), chunk_size, fchunk);
+        fclose(fchunk);
+        chunk_files.push_back(chunk_file);
+    }
+    fclose(fin);
+    chunk_buffer.clear();
+    chunk_buffer.shrink_to_fit();
+
+    // Phase 2: K-way merge
+    std::cerr << "[Sort] Merging " << n_chunks << " sorted chunks...\n";
+
+    // Open all chunk files
+    std::vector<FILE*> chunk_fps(n_chunks);
+    for (size_t i = 0; i < n_chunks; ++i) {
+        chunk_fps[i] = fopen(chunk_files[i].c_str(), "rb");
+        if (!chunk_fps[i]) {
+            std::cerr << "[ERROR] Cannot open chunk file " << chunk_files[i] << "\n";
+            return false;
+        }
+    }
+
+    // Output file
+    FILE* fout = fopen(output_file.c_str(), "wb");
+    if (!fout) {
+        std::cerr << "[ERROR] Cannot open " << output_file << " for writing\n";
+        return false;
+    }
+
+    // Initialize min-heap with first segment from each chunk
+    std::priority_queue<MergeEntry, std::vector<MergeEntry>, std::greater<MergeEntry>> heap;
+
+    for (size_t i = 0; i < n_chunks; ++i) {
+        MergeEntry entry;
+        if (fread(&entry.seg, sizeof(BinarySegment), 1, chunk_fps[i]) == 1) {
+            entry.file_idx = static_cast<int>(i);
+            heap.push(entry);
+        }
+    }
+
+    // Output buffer for efficiency
+    const size_t OUT_BUFFER_SIZE = 100000;
+    std::vector<BinarySegment> out_buffer;
+    out_buffer.reserve(OUT_BUFFER_SIZE);
+    size_t merged_count = 0;
+
+    // Merge
+    while (!heap.empty()) {
+        MergeEntry top = heap.top();
+        heap.pop();
+
+        out_buffer.push_back(top.seg);
+        if (out_buffer.size() >= OUT_BUFFER_SIZE) {
+            fwrite(out_buffer.data(), sizeof(BinarySegment), out_buffer.size(), fout);
+            out_buffer.clear();
+        }
+
+        // Read next segment from same file
+        MergeEntry next;
+        if (fread(&next.seg, sizeof(BinarySegment), 1, chunk_fps[top.file_idx]) == 1) {
+            next.file_idx = top.file_idx;
+            heap.push(next);
+        }
+    }
+
+    // Flush remaining
+    if (!out_buffer.empty()) {
+        fwrite(out_buffer.data(), sizeof(BinarySegment), out_buffer.size(), fout);
+    }
+
+    fclose(fout);
+
+    // Close and delete temp files
+    for (size_t i = 0; i < n_chunks; ++i) {
+        fclose(chunk_fps[i]);
+        std::remove(chunk_files[i].c_str());
+    }
+
+    auto total_end = std::chrono::steady_clock::now();
+    auto total_sec = std::chrono::duration_cast<std::chrono::seconds>(total_end - total_start).count();
+    std::cerr << "[Sort] External sort completed in " << total_sec << " seconds\n";
+
+    return true;
+}
+
+/**
+ * Convert TSV segments to binary format for fast processing.
+ * This runs as part of the augmentation phase.
+ *
+ * TSV format: sample1\thap1\tsample2\thap2\tstart_bp\tend_bp\tlength_cm
+ * Binary format: BinarySegment (28 bytes, includes site indices)
+ *
+ * @param tsv_file     Path to input TSV file
+ * @param bin_file     Path to output binary file
+ * @param positions    VCF bp positions for bp->site index conversion
+ * @return             Number of segments converted, or -1 on error
+ */
+int64_t convertTsvToBinary(const std::string& tsv_file, const std::string& bin_file,
+                            const std::vector<int>& positions) {
+    FILE* fin = fopen(tsv_file.c_str(), "r");
+    if (!fin) {
+        std::cerr << "[ERROR] Cannot open " << tsv_file << " for reading\n";
+        return -1;
+    }
+
+    FILE* fout = fopen(bin_file.c_str(), "wb");
+    if (!fout) {
+        std::cerr << "[ERROR] Cannot open " << bin_file << " for writing\n";
+        fclose(fin);
+        return -1;
+    }
+
+    // Buffer for writing (reduces syscalls)
+    const size_t BUFFER_SIZE = 16384;
+    std::vector<BinarySegment> buffer;
+    buffer.reserve(BUFFER_SIZE);
+
+    int64_t count = 0;
+    char line[256];
+
+    auto start = std::chrono::steady_clock::now();
+
+    while (fgets(line, sizeof(line), fin)) {
+        int sample1, hap1_idx, sample2, hap2_idx, start_bp, end_bp;
+        double length_cm;
+
+        if (sscanf(line, "%d\t%d\t%d\t%d\t%d\t%d\t%lf",
+                   &sample1, &hap1_idx, &sample2, &hap2_idx,
+                   &start_bp, &end_bp, &length_cm) != 7) {
+            continue;  // Skip malformed lines
+        }
+
+        // Convert sample+hap to combined haplotype index
+        int hap1 = sample1 * 2 + hap1_idx;
+        int hap2 = sample2 * 2 + hap2_idx;
+
+        // Binary search for site indices
+        auto start_it = std::lower_bound(positions.begin(), positions.end(), start_bp);
+        auto end_it = std::lower_bound(positions.begin(), positions.end(), end_bp);
+
+        int start_idx = static_cast<int>(start_it - positions.begin());
+        int end_idx = static_cast<int>(end_it - positions.begin());
+
+        // Adjust end_idx to be the actual site at or before end_bp
+        if (end_idx > 0 && (end_it == positions.end() || *end_it > end_bp)) {
+            end_idx--;
+        }
+
+        BinarySegment seg;
+        seg.hap1 = hap1;
+        seg.hap2 = hap2;
+        seg.start_idx = start_idx;
+        seg.end_idx = end_idx;
+        seg.start_bp = start_bp;
+        seg.end_bp = end_bp;
+        seg.length_cm = static_cast<float>(length_cm);
+
+        buffer.push_back(seg);
+        count++;
+
+        if (buffer.size() >= BUFFER_SIZE) {
+            fwrite(buffer.data(), sizeof(BinarySegment), buffer.size(), fout);
+            buffer.clear();
+        }
+    }
+
+    // Flush remaining
+    if (!buffer.empty()) {
+        fwrite(buffer.data(), sizeof(BinarySegment), buffer.size(), fout);
+    }
+
+    fclose(fin);
+    fclose(fout);
+
+    auto end = std::chrono::steady_clock::now();
+    auto sec = std::chrono::duration_cast<std::chrono::seconds>(end - start).count();
+    std::cerr << "[TSV->Binary] Converted " << count << " segments in " << sec << " seconds\n";
+
+    return count;
+}
+
 // Striped deduplication to reduce mutex contention with multiple threads
 // Each stripe has its own mutex, so threads accessing different stripes don't block
 class StripedDedup {
@@ -581,42 +782,52 @@ public:
     }
 };
 
-// Per-thread output buffer with striped deduplication for reduced contention
+// Per-thread output buffer for both binary and TSV segments
 class OutputBuffer {
 private:
-    static const size_t BUFFER_THRESHOLD = 1 << 18;  // 256 KB
-    std::string buffer;
-    FILE* output_file;
+    static const size_t BUFFER_THRESHOLD = 8192;  // ~8K segments
+    std::vector<BinarySegment> bin_buffer;
+    std::string tsv_buffer;
+    FILE* bin_file;
+    FILE* tsv_file;
     std::mutex& file_mtx;
     std::atomic<size_t>& segment_count;
     StripedDedup& dedup;
-    size_t local_count = 0;  // Thread-local counter to reduce atomic contention
+    size_t local_count = 0;
 
 public:
-    OutputBuffer(FILE* file, std::mutex& mtx, std::atomic<size_t>& count, StripedDedup& dedup_ref)
-        : output_file(file), file_mtx(mtx), segment_count(count), dedup(dedup_ref) {
-        buffer.reserve(BUFFER_THRESHOLD * 3 / 2);
+    OutputBuffer(FILE* bin, FILE* tsv, std::mutex& mtx, std::atomic<size_t>& count, StripedDedup& dedup_ref)
+        : bin_file(bin), tsv_file(tsv), file_mtx(mtx), segment_count(count), dedup(dedup_ref) {
+        bin_buffer.reserve(BUFFER_THRESHOLD * 3 / 2);
+        tsv_buffer.reserve(BUFFER_THRESHOLD * 50);  // ~50 bytes per TSV line
     }
 
-    // Write segment data to buffer
-    bool write(const char* data, size_t len, const SegmentKey& key) {
-        buffer.append(data, len);
-        local_count++;  // Thread-local, no atomic overhead
+    // Write segment to both buffers
+    void writeBinary(const BinarySegment& seg) {
+        bin_buffer.push_back(seg);
 
-        // Flush when buffer exceeds threshold
-        if (buffer.size() >= BUFFER_THRESHOLD) {
+        // Also format TSV line
+        char line[128];
+        int len = snprintf(line, sizeof(line), "%d\t%d\t%d\t%d\t%d\t%d\t%.6f\n",
+                          seg.hap1 / 2, seg.hap1 & 1, seg.hap2 / 2, seg.hap2 & 1,
+                          seg.start_bp, seg.end_bp, static_cast<double>(seg.length_cm));
+        tsv_buffer.append(line, len);
+
+        local_count++;
+
+        if (bin_buffer.size() >= BUFFER_THRESHOLD) {
             flush();
         }
-        return true;
     }
 
     void flush() {
-        if (!buffer.empty()) {
+        if (!bin_buffer.empty()) {
             std::lock_guard<std::mutex> lock(file_mtx);
-            fwrite(buffer.data(), 1, buffer.size(), output_file);
-            buffer.clear();
+            fwrite(bin_buffer.data(), sizeof(BinarySegment), bin_buffer.size(), bin_file);
+            fwrite(tsv_buffer.data(), 1, tsv_buffer.size(), tsv_file);
+            bin_buffer.clear();
+            tsv_buffer.clear();
         }
-        // Batch update global counter
         if (local_count > 0) {
             segment_count.fetch_add(local_count, std::memory_order_relaxed);
             local_count = 0;
@@ -1468,8 +1679,6 @@ void processSeedBatch(
     int LastMarker,
     OutputBuffer& output_buffer)
 {
-    char line_buffer[256];  // Thread-local line buffer
-
     // Precompute mM1 once for all seeds in batch (avoids repeated floor/division)
     const int mM1 = static_cast<int>(std::floor((MIN_EXTEND / MIN_SEED_CM) * MIN_MARKERS)) - 1;
 
@@ -1502,24 +1711,18 @@ void processSeedBatch(
                                       MIN_SEED_CM, MAX_GAP, MIN_MARKERS, MIN_EXTEND, LastMarker, mM1);
             }
 
-            // Write segment to buffer with deduplication (use MIN_OUTPUT_CM for final filtering)
+            // Write segment to buffer (use MIN_OUTPUT_CM for final filtering)
             double length_cm = genPos[nextInclEnd] - genPos[nStart];
             if (length_cm >= MIN_OUTPUT_CM && (hap1 >> 1) != (hap2 >> 1)) {
-                // Normalize haplotype order for consistent dedup across windows
-                // (PBWT order differs between windows, so same pair might be (5,10) vs (10,5))
-                // Use full haplotype IDs, not sample IDs, to distinguish different hap pairs
-                int h1 = std::min(hap1, hap2);
-                int h2 = std::max(hap1, hap2);
-                SegmentKey key = {h1, h2,
-                                 meta.vcf_bp_positions[nStart],
-                                 meta.vcf_bp_positions[nextInclEnd]};
-                int len = snprintf(line_buffer, sizeof(line_buffer),
-                                  "%d\t%d\t%d\t%d\t%d\t%d\t%.6f\n",
-                                  hap1 / 2, hap1 & 1, hap2 / 2, hap2 & 1,
-                                  meta.vcf_bp_positions[nStart],
-                                  meta.vcf_bp_positions[nextInclEnd],
-                                  length_cm);
-                output_buffer.write(line_buffer, len, key);
+                BinarySegment seg;
+                seg.hap1 = hap1;
+                seg.hap2 = hap2;
+                seg.start_idx = nStart;
+                seg.end_idx = nextInclEnd;
+                seg.start_bp = meta.vcf_bp_positions[nStart];
+                seg.end_bp = meta.vcf_bp_positions[nextInclEnd];
+                seg.length_cm = static_cast<float>(length_cm);
+                output_buffer.writeBinary(seg);
             }
         }
     }
@@ -1553,18 +1756,19 @@ void runWindowThread(
     SeedQueue& seedQ,
     std::atomic<int>& finished_count,
     int n_windows,
-    FILE* output_file,
+    FILE* bin_file,
+    FILE* tsv_file,
     std::mutex& file_mtx,
     std::atomic<size_t>& segment_count,
     StripedDedup& dedup,
     bool isLastWindow,
-    TimingStats& timing)  // Added timing parameter
+    TimingStats& timing)
 {
     const size_t SEED_LIST_THRESHOLD = 65536;
     int n_haps = meta.n_haps;
 
-    // Create per-thread output buffer
-    OutputBuffer output_buffer(output_file, file_mtx, segment_count, dedup);
+    // Create per-thread output buffer (writes both binary and TSV)
+    OutputBuffer output_buffer(bin_file, tsv_file, file_mtx, segment_count, dedup);
 
     // Initialize PBWT state for this window
     PBWTState st(n_haps);
@@ -1658,7 +1862,8 @@ void runWindowThread(
                 // Not using queue OR queue full - process inline
                 // (If offer failed, to_flush still contains data since move only happens on success)
                 auto te1 = std::chrono::high_resolution_clock::now();
-                processSeedBatch(to_flush, genPos, meta, hap_major, MIN_SEED_CM, MIN_OUTPUT_CM,
+                processSeedBatch(to_flush, genPos, meta, hap_major,
+                               MIN_SEED_CM, MIN_OUTPUT_CM,
                                MAX_GAP, MIN_MARKERS, MIN_EXTEND, LastMarker,
                                output_buffer);
                 auto te2 = std::chrono::high_resolution_clock::now();
@@ -1673,7 +1878,8 @@ void runWindowThread(
     // Process remaining seeds
     if (!seedList.empty()) {
         auto te1 = std::chrono::high_resolution_clock::now();
-        processSeedBatch(seedList, genPos, meta, hap_major, MIN_SEED_CM, MIN_OUTPUT_CM,
+        processSeedBatch(seedList, genPos, meta, hap_major,
+                        MIN_SEED_CM, MIN_OUTPUT_CM,
                         MAX_GAP, MIN_MARKERS, MIN_EXTEND, LastMarker,
                         output_buffer);
         auto te2 = std::chrono::high_resolution_clock::now();
@@ -1695,7 +1901,8 @@ void runWindowThread(
     std::vector<Seed> batch;
     while (finished_count.load() < n_windows || !seedQ.empty()) {
         if (seedQ.poll(batch)) {
-            processSeedBatch(batch, genPos, meta, hap_major, MIN_SEED_CM, MIN_OUTPUT_CM,
+            processSeedBatch(batch, genPos, meta, hap_major,
+                           MIN_SEED_CM, MIN_OUTPUT_CM,
                            MAX_GAP, MIN_MARKERS, MIN_EXTEND, LastMarker,
                            output_buffer);
         }
@@ -1750,6 +1957,10 @@ int main(int argc, char** argv) {
     ps_params.nthreads = nthreads;
     ps_params.verbose = false;  // Disable detailed P-smoother output
 
+    // Thread configuration for augmentation phase
+    int extract_threads = nthreads;
+    int xgb_threads = nthreads;
+
     std::cerr << "[INFO] Using " << nthreads << " thread(s)\n";
     std::cerr << "[INFO] min-output=" << min_output << " cM\n";
     if (skip_psmoother) {
@@ -1781,11 +1992,18 @@ int main(int argc, char** argv) {
     }
     auto vcf_end = std::chrono::steady_clock::now();
 
+    // Correction locations from P-smoother (persists for feature extraction)
+    std::vector<std::pair<int, int>> correction_locations;
+
     // Run P-smoother for haplotype error correction (unless disabled)
     if (!skip_psmoother) {
         auto ps_start = std::chrono::steady_clock::now();
         PSmoother smoother(meta.n_haps, meta.n_sites, ps_params);
         int corrections = smoother.smooth(hap_2d);
+        std::cerr << "[P-smoother] Correction locations tracked: "
+                  << smoother.getCorrections().size() << std::endl;
+        // Copy corrections before smoother goes out of scope
+        correction_locations = smoother.getCorrections();
         auto ps_end = std::chrono::steady_clock::now();
         double ps_time = std::chrono::duration<double>(ps_end - ps_start).count();
 
@@ -1841,7 +2059,7 @@ int main(int argc, char** argv) {
 
     // Create haplotype-major layout for cache-friendly extension
     HapMajorData hap_major;
-    hap_major.transpose(meta, hap_data, nthreads);
+    transposeToHapMajor(hap_major, meta, hap_data, nthreads);
 
     // Read genetic map and interpolate positions
     GeneticMap gmap = readGeneticMap(map_path);
@@ -1856,10 +2074,11 @@ int main(int argc, char** argv) {
     int MIN_MARKERS = 100;
     int LastMarker = n_sites - 1;
 
-    // Open output file
-    FILE* output_file = fopen("segments2.tsv", "w");
-    if (!output_file) {
-        std::cerr << "[ERROR] Cannot open output file\n";
+    // Open output files (both binary for ML pipeline and TSV for human inspection)
+    FILE* bin_file = fopen("Segments.bin", "wb");
+    FILE* tsv_file = fopen("Segments.tsv", "w");
+    if (!bin_file || !tsv_file) {
+        std::cerr << "[ERROR] Cannot open output files for writing\n";
         return 1;
     }
 
@@ -1881,7 +2100,20 @@ int main(int argc, char** argv) {
         std::vector<uint8_t> site_buffer(n_haps);
         std::vector<Seed> seeds;
         seeds.reserve(SEED_LIST_THRESHOLD);
-        char line_buffer[256];  // For formatted output
+
+        // Output buffers for single-threaded (both binary and TSV)
+        std::vector<BinarySegment> seg_buffer;
+        std::string tsv_buffer;
+        seg_buffer.reserve(8192);
+        tsv_buffer.reserve(8192 * 50);
+        auto flushSegBuffer = [&]() {
+            if (!seg_buffer.empty()) {
+                fwrite(seg_buffer.data(), sizeof(BinarySegment), seg_buffer.size(), bin_file);
+                fwrite(tsv_buffer.data(), 1, tsv_buffer.size(), tsv_file);
+                seg_buffer.clear();
+                tsv_buffer.clear();
+            }
+        };
 
         // Precompute mM1 once (avoids repeated floor/division in hot loop)
         const int mM1 = static_cast<int>(std::floor((MIN_EXTEND / MIN_SEED_CM) * MIN_MARKERS)) - 1;
@@ -1917,17 +2149,30 @@ int main(int argc, char** argv) {
                                               MIN_SEED_CM, MAX_GAP, MIN_MARKERS, MIN_EXTEND, LastMarker, mM1);
                     }
 
-                    // Write segment to file (use MIN_OUTPUT_CM for final filtering)
+                    // Write segment to buffer (use MIN_OUTPUT_CM for final filtering)
                     double length_cm = genPos[nextInclEnd] - genPos[nStart];
                     if (length_cm >= MIN_OUTPUT_CM && (hap1 >> 1) != (hap2 >> 1)) {
-                        int len = snprintf(line_buffer, sizeof(line_buffer),
-                                          "%d\t%d\t%d\t%d\t%d\t%d\t%.6f\n",
+                        BinarySegment seg;
+                        seg.hap1 = hap1;
+                        seg.hap2 = hap2;
+                        seg.start_idx = nStart;
+                        seg.end_idx = nextInclEnd;
+                        seg.start_bp = meta.vcf_bp_positions[nStart];
+                        seg.end_bp = meta.vcf_bp_positions[nextInclEnd];
+                        seg.length_cm = static_cast<float>(length_cm);
+                        seg_buffer.push_back(seg);
+
+                        // Also format TSV line
+                        char line[128];
+                        int len = snprintf(line, sizeof(line), "%d\t%d\t%d\t%d\t%d\t%d\t%.6f\n",
                                           hap1 / 2, hap1 & 1, hap2 / 2, hap2 & 1,
-                                          meta.vcf_bp_positions[nStart],
-                                          meta.vcf_bp_positions[nextInclEnd],
-                                          length_cm);
-                        fwrite(line_buffer, 1, len, output_file);
+                                          seg.start_bp, seg.end_bp, length_cm);
+                        tsv_buffer.append(line, len);
+
                         segment_count++;
+                        if (seg_buffer.size() >= 8192) {
+                            flushSegBuffer();
+                        }
                     }
                 }
             }
@@ -1951,7 +2196,10 @@ int main(int argc, char** argv) {
             processBatch();
         }
 
-        fclose(output_file);
+        // Flush remaining segments
+        flushSegBuffer();
+        fclose(bin_file);
+        fclose(tsv_file);
 
         auto end_time = std::chrono::steady_clock::now();
         auto total_elapsed = std::chrono::duration_cast<std::chrono::seconds>(end_time - start_time).count();
@@ -1989,7 +2237,7 @@ int main(int argc, char** argv) {
                                std::cref(genPos),
                                MIN_SEED_CM, MIN_OUTPUT_CM, MAX_GAP, MIN_MARKERS, MIN_EXTEND, LastMarker,
                                std::ref(seedQ), std::ref(finished_count), actual_threads,
-                               output_file, std::ref(file_mtx), std::ref(segment_count),
+                               bin_file, tsv_file, std::ref(file_mtx), std::ref(segment_count),
                                std::ref(dedup),
                                isLastWindow,
                                std::ref(timing));
@@ -2005,7 +2253,7 @@ int main(int argc, char** argv) {
             std::cref(genPos),
             MIN_SEED_CM, MIN_OUTPUT_CM, MAX_GAP, MIN_MARKERS, MIN_EXTEND, LastMarker,
             std::ref(seedQ), std::ref(finished_count), actual_threads,
-            output_file, std::ref(file_mtx), std::ref(segment_count),
+            bin_file, tsv_file, std::ref(file_mtx), std::ref(segment_count),
             std::ref(dedup),
             true,  // isLastWindow
             std::ref(timing));
@@ -2017,7 +2265,8 @@ int main(int argc, char** argv) {
 
         seedQ.markFinished();
 
-        fclose(output_file);
+        fclose(bin_file);
+        fclose(tsv_file);
 
         auto end_time = std::chrono::steady_clock::now();
         auto total_elapsed = std::chrono::duration_cast<std::chrono::seconds>(end_time - start_time).count();
@@ -2030,4 +2279,267 @@ int main(int argc, char** argv) {
                 << (n_samples > 0 ? double(segment_count.load()) / n_samples : 0.0) << "\n";
         std::cout << "Wallclock Time:  " << total_elapsed << " s\n";
     }
+
+    // ============================================================
+    // Segment Augmentation Phase
+    // ============================================================
+    //
+    // Uses machine learning to filter false-positive IBD segments.
+    //
+    // Feature extraction: For each segment, divide into 10 chunks and extract:
+    //   - Physical length (bp)
+    //   - Genetic length (cM)
+    //   - Number of mismatches (allele differences between haplotypes)
+    //   - Number of P-smoother corrections
+    // Total: 40 features per segment (10 chunks × 4 features)
+    //
+    // Two-pass global normalization (StandardScaler):
+    //   Pass 1: Compute global mean and std across ALL segments
+    //   Pass 2: Normalize each segment using global stats, then predict
+    //
+    // This ensures consistent normalization regardless of batch size.
+    // ============================================================
+
+    std::cout << "[Augmentation] Starting segment augmentation...\n";
+    auto augment_start = std::chrono::steady_clock::now();
+
+    // Create feature extractor using data still in memory from detection phase
+    // NOTE: hap_major layout enables fast XOR+popcount mismatch counting
+    FeatureExtractorParams fe_params;
+    fe_params.n_chunks = 10;   // 10 chunks per segment
+    fe_params.verbose = false;
+    FeatureExtractor feature_extractor(meta, hap_major, genPos, correction_locations, fe_params);
+
+    const size_t BATCH_SIZE = 100000;  // Process segments in batches to limit memory
+    const int n_features = 40;         // 10 chunks × 4 features per chunk
+
+    // Open binary segments file for reading
+    FILE* seg_file = fopen("Segments.bin", "rb");
+    if (!seg_file) {
+        std::cerr << "[ERROR] Cannot open Segments.bin for reading\n";
+        return 1;
+    }
+
+    // Get total segment count from file size
+    fseek(seg_file, 0, SEEK_END);
+    size_t file_size = ftell(seg_file);
+    size_t total_segments = file_size / sizeof(BinarySegment);
+    fseek(seg_file, 0, SEEK_SET);
+
+    // Buffers (reused for both passes)
+    std::vector<BinarySegment> read_buffer(BATCH_SIZE);
+    std::vector<IBDSegment> segment_batch;
+    segment_batch.reserve(BATCH_SIZE);
+    std::vector<float> batch_features(BATCH_SIZE * n_features);
+
+    // ============================================================
+    // Pass 1: Compute global statistics (mean and std for each feature)
+    // ============================================================
+    std::cout << "[Augmentation] Computing global statistics...\n";
+    auto stats_start = std::chrono::steady_clock::now();
+
+    // Use double for accumulation to avoid floating-point precision loss
+    std::vector<double> global_sum(n_features, 0.0);
+    std::vector<double> global_sum_sq(n_features, 0.0);
+    size_t total_count = 0;
+
+    size_t segments_read = 0;
+    while (segments_read < total_segments) {  // Process ALL segments for global statistics
+        size_t to_read = std::min(BATCH_SIZE, total_segments - segments_read);
+        size_t n_read = fread(read_buffer.data(), sizeof(BinarySegment), to_read, seg_file);
+        if (n_read == 0) break;
+
+        // Convert BinarySegment to IBDSegment
+        segment_batch.clear();
+        for (size_t i = 0; i < n_read; ++i) {
+            const BinarySegment& bs = read_buffer[i];
+            IBDSegment seg;
+            seg.hap1 = bs.hap1;
+            seg.hap2 = bs.hap2;
+            seg.start_idx = bs.start_idx;
+            seg.end_idx = bs.end_idx;
+            seg.start_bp = bs.start_bp;
+            seg.end_bp = bs.end_bp;
+            seg.length_cm = bs.length_cm;
+            segment_batch.push_back(seg);
+        }
+
+        // Extract features
+        feature_extractor.extractBatchFlat(segment_batch, batch_features.data(), extract_threads);
+
+        // Accumulate sum and sum² for each feature
+        for (size_t i = 0; i < n_read; ++i) {
+            for (int f = 0; f < n_features; ++f) {
+                double val = batch_features[i * n_features + f];
+                global_sum[f] += val;
+                global_sum_sq[f] += val * val;
+            }
+        }
+        total_count += n_read;
+        segments_read += n_read;
+
+        // Progress
+        double progress = static_cast<double>(segments_read) / total_segments;
+        std::cout << "\r[Computing statistics] " << std::fixed << std::setprecision(1)
+                  << (progress * 100.0) << "%" << std::flush;
+    }
+    std::cout << "\n";
+
+    // Compute global mean and std: mean = sum/n, std = sqrt(sum²/n - mean²)
+    std::vector<float> global_mean(n_features);
+    std::vector<float> global_std(n_features);
+    for (int f = 0; f < n_features; ++f) {
+        global_mean[f] = static_cast<float>(global_sum[f] / total_count);
+        double variance = (global_sum_sq[f] / total_count) - (global_mean[f] * global_mean[f]);
+        global_std[f] = static_cast<float>(std::sqrt(std::max(0.0, variance)));
+        if (global_std[f] < 1e-8f) global_std[f] = 1.0f;  // Avoid division by zero
+    }
+
+    auto stats_end = std::chrono::steady_clock::now();
+    double stats_sec = std::chrono::duration<double>(stats_end - stats_start).count();
+
+    // ============================================================
+    // Pass 2: Normalize features and run XGBoost prediction
+    // ============================================================
+    std::cout << "[Augmentation] Running prediction...\n";
+    auto predict_start = std::chrono::steady_clock::now();
+
+    // Reset file position for second pass
+    fseek(seg_file, 0, SEEK_SET);
+
+    // Load XGBoost model
+    std::string model_path = "../Reproducibility/models/xgb_ibd_augmentation.json";
+    XGBPredictor predictor(model_path, xgb_threads);
+    if (!predictor.isLoaded()) {
+        std::cerr << "[ERROR] Failed to load XGBoost model\n";
+        return 1;
+    }
+
+    // Open output file
+    FILE* out_file = fopen("predicted_segments_xgb.txt", "w");
+    if (!out_file) {
+        std::cerr << "[ERROR] Cannot open predicted_segments_xgb.txt for writing\n";
+        fclose(seg_file);
+        return 1;
+    }
+
+    // Extract chromosome from first site's VCF fixed fields
+    std::string chrom = "NA";
+    if (!meta.vcf_fixed_fields.empty()) {
+        const std::string& first_fixed = meta.vcf_fixed_fields[0];
+        size_t tab_pos = first_fixed.find('\t');
+        if (tab_pos != std::string::npos) {
+            chrom = first_fixed.substr(0, tab_pos);
+        }
+    }
+
+    // Timing accumulators
+    uint64_t total_extract_ns = 0;
+    uint64_t total_predict_ns = 0;
+    size_t positive_predictions = 0;
+
+    segments_read = 0;
+    while (segments_read < total_segments) {
+        size_t to_read = std::min(BATCH_SIZE, total_segments - segments_read);
+        size_t n_read = fread(read_buffer.data(), sizeof(BinarySegment), to_read, seg_file);
+        if (n_read == 0) break;
+
+        // Convert BinarySegment to IBDSegment
+        segment_batch.clear();
+        for (size_t i = 0; i < n_read; ++i) {
+            const BinarySegment& bs = read_buffer[i];
+            IBDSegment seg;
+            seg.hap1 = bs.hap1;
+            seg.hap2 = bs.hap2;
+            seg.start_idx = bs.start_idx;
+            seg.end_idx = bs.end_idx;
+            seg.start_bp = bs.start_bp;
+            seg.end_bp = bs.end_bp;
+            seg.length_cm = bs.length_cm;
+            segment_batch.push_back(seg);
+        }
+        segments_read += n_read;
+
+        // Extract features
+        auto ext_start = std::chrono::high_resolution_clock::now();
+        feature_extractor.extractBatchFlat(segment_batch, batch_features.data(), extract_threads);
+        auto ext_end = std::chrono::high_resolution_clock::now();
+        total_extract_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(ext_end - ext_start).count();
+
+        // Normalize with global mean/std
+        for (size_t i = 0; i < n_read; ++i) {
+            for (int f = 0; f < n_features; ++f) {
+                batch_features[i * n_features + f] =
+                    (batch_features[i * n_features + f] - global_mean[f]) / global_std[f];
+            }
+        }
+
+        // Run XGBoost prediction
+        auto pred_start = std::chrono::high_resolution_clock::now();
+        std::vector<float> predictions = predictor.predictBatch(batch_features.data(), n_read, n_features);
+        auto pred_end = std::chrono::high_resolution_clock::now();
+        total_predict_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(pred_end - pred_start).count();
+
+        // Write kept segments: prediction < 0.5 indicates true IBD (class 0)
+        // XGBoost outputs probability of being false-positive (class 1)
+        std::string out_buffer;
+        out_buffer.reserve(predictions.size() * 80);
+        char line[256];
+        for (size_t i = 0; i < predictions.size(); ++i) {
+            if (predictions[i] < 0.5f) {
+                positive_predictions++;
+                const IBDSegment& seg = segment_batch[i];
+                int sample1 = seg.hap1 / 2;
+                int hap1 = (seg.hap1 % 2) + 1;
+                int sample2 = seg.hap2 / 2;
+                int hap2 = (seg.hap2 % 2) + 1;
+                const std::string& id1 = meta.sampleIDs[sample1];
+                const std::string& id2 = meta.sampleIDs[sample2];
+                int len = snprintf(line, sizeof(line), "%s\t%d\t%s\t%d\t%s\t%d\t%d\t%.6f\n",
+                        id1.c_str(), hap1, id2.c_str(), hap2,
+                        chrom.c_str(), seg.start_bp, seg.end_bp, seg.length_cm);
+                out_buffer.append(line, len);
+            }
+        }
+        fwrite(out_buffer.data(), 1, out_buffer.size(), out_file);
+
+        // Progress bar
+        double progress = static_cast<double>(segments_read) / total_segments;
+        int bar_width = 40;
+        int filled = static_cast<int>(progress * bar_width);
+        std::cout << "\r[";
+        for (int i = 0; i < bar_width; ++i) {
+            if (i < filled) std::cout << "=";
+            else if (i == filled) std::cout << ">";
+            else std::cout << " ";
+        }
+        double batch_ext_ms = std::chrono::duration_cast<std::chrono::milliseconds>(ext_end - ext_start).count();
+        double batch_pred_ms = std::chrono::duration_cast<std::chrono::milliseconds>(pred_end - pred_start).count();
+        std::cout << "] " << std::fixed << std::setprecision(1) << (progress * 100.0) << "% "
+                  << "(ext:" << batch_ext_ms << "ms pred:" << batch_pred_ms << "ms)" << std::flush;
+    }
+    std::cout << "\n";
+
+    fclose(seg_file);
+    fclose(out_file);
+
+    auto augment_end = std::chrono::steady_clock::now();
+    double wallclock_sec = std::chrono::duration<double>(augment_end - augment_start).count();
+    double extract_sec = total_extract_ns / 1e9;
+    double inference_sec = total_predict_ns / 1e9;
+
+    size_t segments_filtered = segments_read - positive_predictions;
+    double kept_pct = 100.0 * positive_predictions / segments_read;
+    double filter_pct = 100.0 * segments_filtered / segments_read;
+
+    std::cout << "\n[Segment Augmentation Results]\n";
+    std::cout << "  segments processed:  " << segments_read << "\n";
+    std::cout << "  segments kept:       " << positive_predictions << " (" << kept_pct << "%)\n";
+    std::cout << "  segments filtered:   " << segments_filtered << " (" << filter_pct << "%)\n";
+    std::cout << "  wall clock time:     " << wallclock_sec << " s\n";
+    std::cout << "  global stats time:   " << stats_sec << " s\n";
+    std::cout << "  feature extraction:  " << extract_sec << " s (" << (segments_read / extract_sec) << " seg/sec)\n";
+    std::cout << "  inference time:      " << inference_sec << " s (" << (segments_read / inference_sec) << " seg/sec)\n";
+    std::cout << "  output file:         predicted_segments_xgb.txt\n";
+
 }

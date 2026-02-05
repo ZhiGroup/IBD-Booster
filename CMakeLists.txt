@@ -23,6 +23,8 @@ set(SRC_FILES
     src/psmoother.cpp
     src/rPBWT.cpp
     src/fwdPBWT.cpp
+    src/feature_extractor.cpp
+    src/xgb_predictor.cpp
     main.cpp
 )
 
@@ -37,7 +39,9 @@ add_executable(IBD-Booster ${SRC_FILES})
 include_directories(/data/cchen32/include)
 find_package(ZLIB REQUIRED)
 find_package(Threads REQUIRED)
-target_link_libraries(IBD-Booster PRIVATE ZLIB::ZLIB /data/cchen32/lib/libhts.so Threads::Threads)
+find_package(OpenMP REQUIRED)
+find_package(xgboost REQUIRED)
+target_link_libraries(IBD-Booster PRIVATE ZLIB::ZLIB /data/cchen32/lib/libhts.so Threads::Threads OpenMP::OpenMP_CXX xgboost::xgboost)
 
 # -----------------------------
 # Compiler optimization flags

@@ -73,6 +73,8 @@ static void countingSortFlat(
 // Process a block of haplotypes for error correction (uses flattened link array)
 // Standard version for single-threaded path
 // IMPORTANT: gap_ptr is the current circular buffer position - must use (gap_ptr + k) % G indexing
+// base_site: the actual site index corresponding to buffer position k=0 (i.e., gap_ptr position)
+// corrections: vector to record (site, hap) pairs when corrections are made
 static int processBlockFlat(
     const vector<int>& link,  // Flattened M x 3 array
     int start, int end,
@@ -81,7 +83,9 @@ static int processBlockFlat(
     int gap_size,
     int gap_ptr,  // Current circular buffer position
     int min_width,
-    double rho)
+    double rho,
+    int base_site,  // Actual site for k=0
+    vector<pair<int, int>>& corrections)
 {
     int blockSize = end - start;
     if (blockSize < min_width) return 0;
@@ -109,6 +113,7 @@ static int processBlockFlat(
                 if (edit_gap[buf_idx][id] != correctAllele) {
                     edit_gap[buf_idx][id] = correctAllele;
                     local_corrections++;
+                    corrections.emplace_back(base_site + k, id);
                 }
             }
         }
@@ -119,6 +124,9 @@ static int processBlockFlat(
 // Process block with pre-allocated counting arrays (avoids per-call allocation)
 // IMPORTANT: Counts from orig_gap (original values), writes corrections to edit_gap
 // IMPORTANT: gap_ptr is the current circular buffer position - must use (gap_ptr + k) % G indexing
+// gap_sites: array mapping buffer index to actual site index
+// corrections: vector to record (site, hap) pairs when corrections are made
+// track: if true, record corrections to the corrections vector (only during active phase)
 static int processBlockPrealloc(
     const vector<int>& link,  // Flattened M x 3 array
     int start, int end,
@@ -130,7 +138,10 @@ static int processBlockPrealloc(
     int G,
     int gap_ptr,  // Current circular buffer position
     int min_width,
-    double rho)
+    double rho,
+    const vector<int>& gap_sites,  // Actual site index for each buffer position
+    vector<pair<int, int>>& corrections,
+    bool track)  // Only track during active phase
 {
     int blockSize = end - start;
     if (blockSize < min_width) return 0;
@@ -166,6 +177,9 @@ static int processBlockPrealloc(
                     edit_gap[buf_idx][id] = correctAllele;
                     gap_modified[buf_idx] = true;
                     local_corrections++;
+                    if (track) {
+                        corrections.emplace_back(gap_sites[buf_idx], id);
+                    }
                 }
             }
         }
@@ -229,6 +243,7 @@ static vector<ForwardWindow> createForwardWindows(int N, int nthreads, int L, in
 }
 
 // Thread function for forward PBWT window
+// correction_locations: output vector for (site, hap) pairs where corrections occurred
 static void runForwardWindowThread(
     int window_id,
     const ForwardWindow& window,
@@ -239,10 +254,14 @@ static void runForwardWindowThread(
     int min_width, double rho,
     atomic<int>& total_corrections,
     atomic<int>& total_blocks,
+    vector<pair<int, int>>& correction_locations,  // Output: (site, hap) pairs
     bool verbose)
 {
     int local_corrections = 0;
     int local_blocks = 0;
+
+    // Thread-local correction tracking (will be merged later)
+    vector<pair<int, int>> local_correction_locs;
 
     // Forward PBWT state
     vector<int> pre(M), div(M);
@@ -378,12 +397,13 @@ static void runForwardWindowThread(
             countingSortFlat(link, 1, M, sort_count, sort_output);
 
             // Process blocks (using pre-allocated counting arrays)
-            // Corrections always happen, but only count stats during active phase
+            // Corrections always happen, but only count/track stats during active phase
             int start = 0;
             for (int i = 1; i < M; ++i) {
                 if (link[i * 3 + 1] != link[(i-1) * 3 + 1] || link[i * 3 + 2] != link[(i-1) * 3 + 2]) {
                     int corr = processBlockPrealloc(link, start, i, orig_gap, edit_gap, gap_modified,
-                                                     zero_count, one_count, G, gap_ptr, min_width, rho);
+                                                     zero_count, one_count, G, gap_ptr, min_width, rho,
+                                                     gap_sites, local_correction_locs, in_active_phase);
                     if (in_active_phase) {
                         local_corrections += corr;
                         local_blocks++;
@@ -392,7 +412,8 @@ static void runForwardWindowThread(
                 }
             }
             int corr = processBlockPrealloc(link, start, M, orig_gap, edit_gap, gap_modified,
-                                             zero_count, one_count, G, gap_ptr, min_width, rho);
+                                             zero_count, one_count, G, gap_ptr, min_width, rho,
+                                             gap_sites, local_correction_locs, in_active_phase);
             if (in_active_phase) {
                 local_corrections += corr;
                 local_blocks++;
@@ -426,6 +447,9 @@ static void runForwardWindowThread(
     // Accumulate stats
     total_corrections += local_corrections;
     total_blocks += local_blocks;
+
+    // Move local correction locations to output vector
+    correction_locations = std::move(local_correction_locs);
 
     if (verbose) {
         cerr << "[P-smoother] fwdPBWT Window " << window_id << " complete: "
@@ -554,16 +578,21 @@ void PSmoother::runForwardPBWT(std::vector<std::vector<uint8_t>>& hap_data) {
                 countingSortFlat(link, 2, M, sort_count, sort_output);
                 countingSortFlat(link, 1, M, sort_count, sort_output);
 
+                // base_site: after gap_ptr advances, gap_ptr position contains site+1
+                int base_site = site + 1;
+
                 int start = 0;
                 for (int i = 1; i < M; ++i) {
                     if (link[i * 3 + 1] != link[(i-1) * 3 + 1] || link[i * 3 + 2] != link[(i-1) * 3 + 2]) {
-                        int corr = processBlockFlat(link, start, i, orig_gap, edit_gap, G, gap_ptr, params.width, params.rho);
+                        int corr = processBlockFlat(link, start, i, orig_gap, edit_gap, G, gap_ptr, params.width, params.rho,
+                                                    base_site, correction_locations);
                         corrections_count += corr;
                         if (i - start >= params.width) blocks_processed++;
                         start = i;
                     }
                 }
-                int corr = processBlockFlat(link, start, M, orig_gap, edit_gap, G, gap_ptr, params.width, params.rho);
+                int corr = processBlockFlat(link, start, M, orig_gap, edit_gap, G, gap_ptr, params.width, params.rho,
+                                            base_site, correction_locations);
                 corrections_count += corr;
                 if (M - start >= params.width) blocks_processed++;
             }
@@ -593,6 +622,9 @@ void PSmoother::runForwardPBWT(std::vector<std::vector<uint8_t>>& hap_data) {
         atomic<int> total_corrections(0);
         atomic<int> total_blocks(0);
 
+        // Per-thread correction location vectors
+        vector<vector<pair<int, int>>> thread_correction_locs(actual_threads);
+
         // Launch worker threads for windows 0 to actual_threads-2
         // Main thread will handle the last window
         vector<thread> threads;
@@ -604,6 +636,7 @@ void PSmoother::runForwardPBWT(std::vector<std::vector<uint8_t>>& hap_data) {
                                M, N, L, G,
                                params.width, params.rho,
                                ref(total_corrections), ref(total_blocks),
+                               ref(thread_correction_locs[w]),
                                params.verbose);
         }
 
@@ -616,11 +649,24 @@ void PSmoother::runForwardPBWT(std::vector<std::vector<uint8_t>>& hap_data) {
             M, N, L, G,
             params.width, params.rho,
             ref(total_corrections), ref(total_blocks),
+            ref(thread_correction_locs[last_w]),
             params.verbose);
 
         // Wait for worker threads
         for (auto& t : threads) {
             t.join();
+        }
+
+        // Merge all thread-local correction locations
+        size_t total_locs = 0;
+        for (const auto& locs : thread_correction_locs) {
+            total_locs += locs.size();
+        }
+        correction_locations.reserve(total_locs);
+        for (auto& locs : thread_correction_locs) {
+            correction_locations.insert(correction_locations.end(),
+                                        std::make_move_iterator(locs.begin()),
+                                        std::make_move_iterator(locs.end()));
         }
 
         corrections_count = total_corrections.load();

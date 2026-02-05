@@ -12,6 +12,7 @@
 #define VCF_UTILS_HPP
 
 #include <cstdint>
+#include <cstring>
 #include <string>
 #include <vector>
 #include <stdexcept>
@@ -46,8 +47,177 @@ struct HapMetadata {
     std::vector<std::string> vcf_fixed_fields; // Fixed fields per site (CHROM...FORMAT\t)
 };
 
-/// Bit-packed haplotype data: one bit per haplotype per site
+/// Bit-packed haplotype data: one bit per haplotype per site (site-major layout)
 using HapData = std::vector<uint8_t>;
+
+// Instead of site-major (all haps for site 0, all haps for site 1, ...),
+// store haplotype-major (all sites for hap 0, all sites for hap 1, ...)
+// This dramatically improves cache locality during extension.
+struct HapMajorData {
+    std::vector<uint8_t> data;  // Packed bits: hap-major layout
+    int n_haps;
+    int n_sites;
+    int bytes_per_hap;  // (n_sites + 7) / 8
+
+    HapMajorData() : n_haps(0), n_sites(0), bytes_per_hap(0) {}
+
+    // Get allele for haplotype h at site s
+    inline uint8_t get(int hap, int site) const {
+        return (data[(size_t)hap * bytes_per_hap + (site >> 3)] >> (site & 7)) & 1;
+    }
+
+    // Fast check if two haplotypes match at a site (XOR-based, single comparison)
+    inline bool allelesMatch(int hap1, int hap2, int site) const {
+        const int byte_idx = site >> 3;
+        const int bit_idx = site & 7;
+        return !((data[(size_t)hap1 * bytes_per_hap + byte_idx] ^
+                  data[(size_t)hap2 * bytes_per_hap + byte_idx]) >> bit_idx & 1);
+    }
+
+    // Get pointer to haplotype's data (for block operations)
+    inline const uint8_t* hapPtr(int hap) const {
+        return data.data() + (size_t)hap * bytes_per_hap;
+    }
+
+    /**
+     * Count mismatches between two haplotypes in a site range using XOR + popcount
+     * ~60x faster than per-site allelesDiffer() calls
+     * @param hap1       First haplotype index
+     * @param hap2       Second haplotype index
+     * @param start_idx  Start site index (inclusive)
+     * @param end_idx    End site index (exclusive)
+     * @return           Number of mismatches
+     */
+    inline int countMismatches(int hap1, int hap2, int start_idx, int end_idx) const {
+        if (start_idx >= end_idx) return 0;
+
+        const uint8_t* __restrict h1_ptr = hapPtr(hap1);
+        const uint8_t* __restrict h2_ptr = hapPtr(hap2);
+
+        int count = 0;
+        int start_byte = start_idx >> 3;
+        int end_byte = (end_idx - 1) >> 3;
+        int start_bit = start_idx & 7;
+        int end_bit = (end_idx - 1) & 7;
+
+        if (start_byte == end_byte) {
+            // All bits in same byte
+            uint8_t mask = ((1u << (end_bit - start_bit + 1)) - 1) << start_bit;
+            uint8_t xored = (h1_ptr[start_byte] ^ h2_ptr[start_byte]) & mask;
+            return __builtin_popcount(xored);
+        }
+
+        // First partial byte
+        if (start_bit != 0) {
+            uint8_t mask = ~((1u << start_bit) - 1);  // bits from start_bit to 7
+            uint8_t xored = (h1_ptr[start_byte] ^ h2_ptr[start_byte]) & mask;
+            count += __builtin_popcount(xored);
+            start_byte++;
+        }
+
+        // Full 64-bit words in the middle
+        while (start_byte + 8 <= end_byte) {
+            uint64_t w1, w2;
+            memcpy(&w1, h1_ptr + start_byte, 8);
+            memcpy(&w2, h2_ptr + start_byte, 8);
+            count += __builtin_popcountll(w1 ^ w2);
+            start_byte += 8;
+        }
+
+        // Remaining full bytes
+        while (start_byte < end_byte) {
+            count += __builtin_popcount(h1_ptr[start_byte] ^ h2_ptr[start_byte]);
+            start_byte++;
+        }
+
+        // Last partial byte
+        uint8_t mask = (1u << (end_bit + 1)) - 1;  // bits 0 to end_bit
+        uint8_t xored = (h1_ptr[end_byte] ^ h2_ptr[end_byte]) & mask;
+        count += __builtin_popcount(xored);
+
+        return count;
+    }
+
+    // Fast 64-bit backward scan to find first mismatch position (scanning backwards)
+    // Returns the first matching position (inclusive), or 0 if matches to beginning
+    // Much faster than bit-by-bit allelesMatch() loop
+    inline int extendMatchBackward64(int hap1, int hap2, int start) const {
+        if (start <= 0) return start;
+
+        const uint8_t* __restrict h1_ptr = hapPtr(hap1);
+        const uint8_t* __restrict h2_ptr = hapPtr(hap2);
+
+        int m = start - 1;
+
+        while (m >= 63) {
+            int word_start_byte = (m - 63) >> 3;
+            if (((m - 63) & 7) == 0) {
+                uint64_t w1, w2;
+                memcpy(&w1, h1_ptr + word_start_byte, 8);
+                memcpy(&w2, h2_ptr + word_start_byte, 8);
+                uint64_t xor_word = w1 ^ w2;
+                if (xor_word == 0) {
+                    m -= 64;
+                    continue;
+                }
+                int highest_mismatch = 63 - __builtin_clzll(xor_word);
+                return (m - 63) + highest_mismatch + 1;
+            }
+            break;
+        }
+
+        while (m >= 0) {
+            const int byte_idx = m >> 3;
+            const int bit_idx = m & 7;
+            if ((h1_ptr[byte_idx] ^ h2_ptr[byte_idx]) >> bit_idx & 1) {
+                return m + 1;
+            }
+            --m;
+        }
+
+        return 0;
+    }
+
+    // Fast 64-bit forward scan to find first mismatch position
+    // Returns the last matching position (inclusive), or LastMarker if matches to end
+    // Much faster than bit-by-bit allelesMatch() loop
+    inline int extendMatchForward64(int hap1, int hap2, int start, int LastMarker) const {
+        if (start >= LastMarker) return start;
+
+        const uint8_t* __restrict h1_ptr = hapPtr(hap1);
+        const uint8_t* __restrict h2_ptr = hapPtr(hap2);
+
+        int m = start + 1;
+
+        while (m + 64 <= LastMarker) {
+            if ((m & 7) == 0) {
+                int word_start_byte = m >> 3;
+                uint64_t w1, w2;
+                memcpy(&w1, h1_ptr + word_start_byte, 8);
+                memcpy(&w2, h2_ptr + word_start_byte, 8);
+                uint64_t xor_word = w1 ^ w2;
+                if (xor_word == 0) {
+                    m += 64;
+                    continue;
+                }
+                int lowest_mismatch = __builtin_ctzll(xor_word);
+                return m + lowest_mismatch - 1;
+            }
+            break;
+        }
+
+        while (m <= LastMarker) {
+            const int byte_idx = m >> 3;
+            const int bit_idx = m & 7;
+            if ((h1_ptr[byte_idx] ^ h2_ptr[byte_idx]) >> bit_idx & 1) {
+                return m - 1;
+            }
+            ++m;
+        }
+
+        return LastMarker;
+    }
+};
 
 /// Genetic map: bp positions and corresponding cM positions
 struct GeneticMap {

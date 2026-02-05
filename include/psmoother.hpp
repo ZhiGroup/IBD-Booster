@@ -20,6 +20,7 @@
 #include <vector>
 #include <cstdint>
 #include <string>
+#include <utility>
 
 /**
  * PSmootherParams: Configuration parameters for P-smoother.
@@ -54,6 +55,12 @@ public:
     int getCorrectionsCount() const { return corrections_count; }
     int getBlocksProcessed() const { return blocks_processed; }
 
+    // Get correction locations - sorted vector of (site_index, haplotype_index) pairs
+    const std::vector<std::pair<int, int>>& getCorrections() const { return correction_locations; }
+
+    // Clear correction tracking data (to free memory after use)
+    void clearCorrectionTracking() { correction_locations.clear(); correction_locations.shrink_to_fit(); }
+
 private:
     int M;  // number of haplotypes
     int N;  // number of sites
@@ -62,6 +69,10 @@ private:
     // Statistics
     int corrections_count = 0;
     int blocks_processed = 0;
+
+    // Correction tracking: (site_index, haplotype_index) pairs
+    // Populated during smoothing, sorted after completion
+    std::vector<std::pair<int, int>> correction_locations;
 
     // Reverse PBWT data (computed by runReversePBWT)
     // Stored as flattened [site * M + i] for memory efficiency

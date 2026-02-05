@@ -16,6 +16,7 @@
 #include "psmoother.hpp"
 #include <iostream>
 #include <chrono>
+#include <algorithm>
 
 using namespace std;
 
@@ -43,6 +44,14 @@ int PSmoother::smooth(std::vector<std::vector<uint8_t>>& hap_data) {
 
     // Step 2: Run forward PBWT with error correction
     runForwardPBWT(hap_data);
+
+    // Sort correction locations by (site, haplotype) for efficient range queries
+    std::sort(correction_locations.begin(), correction_locations.end());
+
+    if (params.verbose) {
+        cerr << "[P-smoother] Tracked " << correction_locations.size()
+             << " correction locations" << endl;
+    }
 
     // Free reverse PBWT memory (no longer needed)
     reverse_pre.clear();
