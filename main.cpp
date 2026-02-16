@@ -25,6 +25,7 @@
 #include "../include/psmoother.hpp"
 #include "../include/feature_extractor.hpp"
 #include "../include/xgb_predictor.hpp"
+#include "../include/nn_predictor.hpp"
 #include <iostream>
 #include <fstream>
 #include <vector>
@@ -2075,8 +2076,8 @@ int main(int argc, char** argv) {
     int LastMarker = n_sites - 1;
 
     // Open output files (both binary for ML pipeline and TSV for human inspection)
-    FILE* bin_file = fopen("Segments.bin", "wb");
-    FILE* tsv_file = fopen("Segments.tsv", "w");
+    FILE* bin_file = fopen("subset_5k_Segments.bin", "wb");
+    FILE* tsv_file = fopen("subset_5k_Segments.tsv", "w");
     if (!bin_file || !tsv_file) {
         std::cerr << "[ERROR] Cannot open output files for writing\n";
         return 1;
@@ -2314,9 +2315,9 @@ int main(int argc, char** argv) {
     const int n_features = 40;         // 10 chunks × 4 features per chunk
 
     // Open binary segments file for reading
-    FILE* seg_file = fopen("Segments.bin", "rb");
+    FILE* seg_file = fopen("subset_5k_Segments.bin", "rb");
     if (!seg_file) {
-        std::cerr << "[ERROR] Cannot open Segments.bin for reading\n";
+        std::cerr << "[ERROR] Cannot open subset_5k_Segments.bin for reading\n";
         return 1;
     }
 
@@ -2415,11 +2416,29 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    // Open output file
-    FILE* out_file = fopen("predicted_segments_xgb.txt", "w");
+    // Load Neural Network model (custom 5-layer MLP, weights exported from PyTorch)
+    // Uses the same 40 normalized features as XGBoost; outputs to a separate file
+    std::string nn_model_path = "../Reproducibility/models/nn_weights.bin";
+    NNPredictor nn_predictor(nn_model_path);
+    if (!nn_predictor.isLoaded()) {
+        std::cerr << "[ERROR] Failed to load NN weights from " << nn_model_path << "\n";
+        return 1;
+    }
+    std::cout << "[Augmentation] NN model loaded from " << nn_model_path << "\n";
+
+    // Open output files
+    FILE* out_file = fopen("subset_5k_predicted_segments_xgb.txt", "w");
     if (!out_file) {
-        std::cerr << "[ERROR] Cannot open predicted_segments_xgb.txt for writing\n";
+        std::cerr << "[ERROR] Cannot open subset_5k_predicted_segments_xgb.txt for writing\n";
         fclose(seg_file);
+        return 1;
+    }
+
+    FILE* nn_out_file = fopen("subset_5k_predicted_segments_nn.txt", "w");
+    if (!nn_out_file) {
+        std::cerr << "[ERROR] Cannot open subset_5k_predicted_segments_nn.txt for writing\n";
+        fclose(seg_file);
+        fclose(out_file);
         return 1;
     }
 
@@ -2436,7 +2455,9 @@ int main(int argc, char** argv) {
     // Timing accumulators
     uint64_t total_extract_ns = 0;
     uint64_t total_predict_ns = 0;
+    uint64_t total_nn_predict_ns = 0;
     size_t positive_predictions = 0;
+    size_t nn_positive_predictions = 0;
 
     segments_read = 0;
     while (segments_read < total_segments) {
@@ -2480,14 +2501,26 @@ int main(int argc, char** argv) {
         auto pred_end = std::chrono::high_resolution_clock::now();
         total_predict_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(pred_end - pred_start).count();
 
-        // Write kept segments: prediction < 0.5 indicates true IBD (class 0)
-        // XGBoost outputs probability of being false-positive (class 1)
+        // Run NN prediction on same normalized features
+        auto nn_pred_start = std::chrono::high_resolution_clock::now();
+        std::vector<float> nn_predictions = nn_predictor.predictBatch(batch_features.data(), n_read, n_features);
+        auto nn_pred_end = std::chrono::high_resolution_clock::now();
+        total_nn_predict_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(nn_pred_end - nn_pred_start).count();
+
+        // Write kept segments to separate output files for each model.
+        // Both models output P(false positive): < 0.5 → keep (true IBD), ≥ 0.5 → filter.
+        // Format-once optimization: format the output line once per segment, then
+        // conditionally append to each model's buffer. This avoids redundant snprintf
+        // calls which dominated runtime when formatting was done independently.
         std::string out_buffer;
         out_buffer.reserve(predictions.size() * 80);
+        std::string nn_out_buffer;
+        nn_out_buffer.reserve(nn_predictions.size() * 80);
         char line[256];
         for (size_t i = 0; i < predictions.size(); ++i) {
-            if (predictions[i] < 0.5f) {
-                positive_predictions++;
+            bool xgb_keep = predictions[i] < 0.5f;
+            bool nn_keep = nn_predictions[i] < 0.5f;
+            if (xgb_keep || nn_keep) {
                 const IBDSegment& seg = segment_batch[i];
                 int sample1 = seg.hap1 / 2;
                 int hap1 = (seg.hap1 % 2) + 1;
@@ -2498,10 +2531,18 @@ int main(int argc, char** argv) {
                 int len = snprintf(line, sizeof(line), "%s\t%d\t%s\t%d\t%s\t%d\t%d\t%.6f\n",
                         id1.c_str(), hap1, id2.c_str(), hap2,
                         chrom.c_str(), seg.start_bp, seg.end_bp, seg.length_cm);
-                out_buffer.append(line, len);
+                if (xgb_keep) {
+                    positive_predictions++;
+                    out_buffer.append(line, len);
+                }
+                if (nn_keep) {
+                    nn_positive_predictions++;
+                    nn_out_buffer.append(line, len);
+                }
             }
         }
         fwrite(out_buffer.data(), 1, out_buffer.size(), out_file);
+        fwrite(nn_out_buffer.data(), 1, nn_out_buffer.size(), nn_out_file);
 
         // Progress bar
         double progress = static_cast<double>(segments_read) / total_segments;
@@ -2522,24 +2563,37 @@ int main(int argc, char** argv) {
 
     fclose(seg_file);
     fclose(out_file);
+    fclose(nn_out_file);
 
     auto augment_end = std::chrono::steady_clock::now();
     double wallclock_sec = std::chrono::duration<double>(augment_end - augment_start).count();
     double extract_sec = total_extract_ns / 1e9;
     double inference_sec = total_predict_ns / 1e9;
+    double nn_inference_sec = total_nn_predict_ns / 1e9;
 
     size_t segments_filtered = segments_read - positive_predictions;
     double kept_pct = 100.0 * positive_predictions / segments_read;
     double filter_pct = 100.0 * segments_filtered / segments_read;
 
+    size_t nn_segments_filtered = segments_read - nn_positive_predictions;
+    double nn_kept_pct = 100.0 * nn_positive_predictions / segments_read;
+    double nn_filter_pct = 100.0 * nn_segments_filtered / segments_read;
+
     std::cout << "\n[Segment Augmentation Results]\n";
     std::cout << "  segments processed:  " << segments_read << "\n";
+    std::cout << "  --- XGBoost ---\n";
     std::cout << "  segments kept:       " << positive_predictions << " (" << kept_pct << "%)\n";
     std::cout << "  segments filtered:   " << segments_filtered << " (" << filter_pct << "%)\n";
+    std::cout << "  output file:         subset_5k_predicted_segments_xgb.txt\n";
+    std::cout << "  --- Neural Network ---\n";
+    std::cout << "  segments kept:       " << nn_positive_predictions << " (" << nn_kept_pct << "%)\n";
+    std::cout << "  segments filtered:   " << nn_segments_filtered << " (" << nn_filter_pct << "%)\n";
+    std::cout << "  output file:         subset_5k_predicted_segments_nn.txt\n";
+    std::cout << "  --- Timing ---\n";
     std::cout << "  wall clock time:     " << wallclock_sec << " s\n";
     std::cout << "  global stats time:   " << stats_sec << " s\n";
     std::cout << "  feature extraction:  " << extract_sec << " s (" << (segments_read / extract_sec) << " seg/sec)\n";
-    std::cout << "  inference time:      " << inference_sec << " s (" << (segments_read / inference_sec) << " seg/sec)\n";
-    std::cout << "  output file:         predicted_segments_xgb.txt\n";
+    std::cout << "  XGB inference:       " << inference_sec << " s (" << (segments_read / inference_sec) << " seg/sec)\n";
+    std::cout << "  NN inference:        " << nn_inference_sec << " s (" << (segments_read / nn_inference_sec) << " seg/sec)\n";
 
 }

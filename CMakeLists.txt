@@ -25,6 +25,7 @@ set(SRC_FILES
     src/fwdPBWT.cpp
     src/feature_extractor.cpp
     src/xgb_predictor.cpp
+    src/nn_predictor.cpp
     main.cpp
 )
 
