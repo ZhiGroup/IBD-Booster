@@ -45,6 +45,7 @@
 #include <thread>
 #include <atomic>
 #include <array>
+#include <memory>
 
 #ifdef __linux__
 #include <pthread.h>
@@ -1922,6 +1923,9 @@ int main(int argc, char** argv) {
         std::cerr << "  --ps-width=N      P-smoother minimum block width (default: 20)\n";
         std::cerr << "  --ps-gap=N        P-smoother gap size (default: 1)\n";
         std::cerr << "  --ps-rho=F        P-smoother error rate threshold (default: 0.05)\n";
+        std::cerr << "  --filter=MODE     Filtering mode: none (default), X (XGBoost), N (Neural Net)\n";
+        std::cerr << "  --model-path=PATH Path to model weights file (default: auto per mode)\n";
+        std::cerr << "  --output=PATH     Output file path for filtered segments\n";
         std::cerr << "\nOutput format (tab-separated):\n";
         std::cerr << "  sample1_idx  hap1  sample2_idx  hap2  start_bp  end_bp  length_cM\n";
         return 1;
@@ -1935,6 +1939,9 @@ int main(int argc, char** argv) {
     double min_output = 2.0;  // Minimum cM length for IBD output segments
     bool skip_psmoother = false;
     PSmootherParams ps_params;  // P-smoother parameters (defaults: L=20, W=20, G=1, rho=0.05)
+    char filter_mode = ' ';    // ' ' = none, 'X' = XGBoost, 'N' = Neural Net
+    std::string model_path;    // User-specified model path (empty = use default per mode)
+    std::string output_path;   // User-specified output path for filtered segments
 
     for (int i = 3; i < argc; ++i) {
         std::string arg = argv[i];
@@ -1952,6 +1959,20 @@ int main(int argc, char** argv) {
             ps_params.gap = std::stoi(arg.substr(9));
         } else if (arg.find("--ps-rho=") == 0) {
             ps_params.rho = std::stod(arg.substr(9));
+        } else if (arg.find("--filter=") == 0) {
+            // ML filtering mode: none (skip augmentation), X (XGBoost), N (Neural Net)
+            std::string mode = arg.substr(9);
+            if (mode == "X" || mode == "x") filter_mode = 'X';
+            else if (mode == "N" || mode == "n") filter_mode = 'N';
+            else if (mode == "none") filter_mode = ' ';
+            else {
+                std::cerr << "[ERROR] Unknown filter mode '" << mode << "'. Use: none, X, or N\n";
+                return 1;
+            }
+        } else if (arg.find("--model-path=") == 0) {
+            model_path = arg.substr(13);
+        } else if (arg.find("--output=") == 0) {
+            output_path = arg.substr(9);
         }
     }
     // Pass thread count to P-smoother for parallel processing
@@ -1964,6 +1985,13 @@ int main(int argc, char** argv) {
 
     std::cerr << "[INFO] Using " << nthreads << " thread(s)\n";
     std::cerr << "[INFO] min-output=" << min_output << " cM\n";
+    if (filter_mode == 'X') {
+        std::cerr << "[INFO] Filter mode: XGBoost\n";
+    } else if (filter_mode == 'N') {
+        std::cerr << "[INFO] Filter mode: Neural Network\n";
+    } else {
+        std::cerr << "[INFO] Filter mode: none (no ML filtering)\n";
+    }
     if (skip_psmoother) {
         std::cerr << "[INFO] P-smoother disabled (--no-psmoother)\n";
     } else {
@@ -2301,6 +2329,9 @@ int main(int argc, char** argv) {
     // This ensures consistent normalization regardless of batch size.
     // ============================================================
 
+    // Skip entire augmentation phase when --filter=none (default).
+    // Only run feature extraction + ML prediction when a filter mode is selected.
+    if (filter_mode == 'X' || filter_mode == 'N') {
     std::cout << "[Augmentation] Starting segment augmentation...\n";
     auto augment_start = std::chrono::steady_clock::now();
 
@@ -2400,7 +2431,7 @@ int main(int argc, char** argv) {
     double stats_sec = std::chrono::duration<double>(stats_end - stats_start).count();
 
     // ============================================================
-    // Pass 2: Normalize features and run XGBoost prediction
+    // Pass 2: Normalize features and run model prediction
     // ============================================================
     std::cout << "[Augmentation] Running prediction...\n";
     auto predict_start = std::chrono::steady_clock::now();
@@ -2408,37 +2439,45 @@ int main(int argc, char** argv) {
     // Reset file position for second pass
     fseek(seg_file, 0, SEEK_SET);
 
-    // Load XGBoost model
-    std::string model_path = "../Reproducibility/models/xgb_ibd_augmentation.json";
-    XGBPredictor predictor(model_path, xgb_threads);
-    if (!predictor.isLoaded()) {
-        std::cerr << "[ERROR] Failed to load XGBoost model\n";
-        return 1;
+    // Resolve model path: use user-supplied --model-path, or fall back to
+    // built-in defaults (XGBoost JSON or NN binary weights)
+    std::string default_xgb_path = "../Reproducibility/models/xgb_ibd_augmentation.json";
+    std::string default_nn_path = "../Reproducibility/models/nn_weights.bin";
+    std::string resolved_model_path = model_path.empty()
+        ? (filter_mode == 'X' ? default_xgb_path : default_nn_path)
+        : model_path;
+
+    // Resolve output path: use user-supplied --output, or default to predicted_segments.txt
+    std::string resolved_output_path = output_path.empty()
+        ? "predicted_segments.txt"
+        : output_path;
+
+    // Load exactly one model based on filter mode (unique_ptr so only the
+    // selected model is allocated; the other stays null)
+    std::unique_ptr<XGBPredictor> xgb_predictor;
+    std::unique_ptr<NNPredictor> nn_predictor;
+
+    if (filter_mode == 'X') {
+        xgb_predictor = std::make_unique<XGBPredictor>(resolved_model_path, xgb_threads);
+        if (!xgb_predictor->isLoaded()) {
+            std::cerr << "[ERROR] Failed to load XGBoost model from " << resolved_model_path << "\n";
+            return 1;
+        }
+        std::cout << "[Augmentation] XGBoost model loaded from " << resolved_model_path << "\n";
+    } else {
+        nn_predictor = std::make_unique<NNPredictor>(resolved_model_path);
+        if (!nn_predictor->isLoaded()) {
+            std::cerr << "[ERROR] Failed to load NN weights from " << resolved_model_path << "\n";
+            return 1;
+        }
+        std::cout << "[Augmentation] NN model loaded from " << resolved_model_path << "\n";
     }
 
-    // Load Neural Network model (custom 5-layer MLP, weights exported from PyTorch)
-    // Uses the same 40 normalized features as XGBoost; outputs to a separate file
-    std::string nn_model_path = "../Reproducibility/models/nn_weights.bin";
-    NNPredictor nn_predictor(nn_model_path);
-    if (!nn_predictor.isLoaded()) {
-        std::cerr << "[ERROR] Failed to load NN weights from " << nn_model_path << "\n";
-        return 1;
-    }
-    std::cout << "[Augmentation] NN model loaded from " << nn_model_path << "\n";
-
-    // Open output files
-    FILE* out_file = fopen("subset_5k_predicted_segments_xgb.txt", "w");
+    // Open output file
+    FILE* out_file = fopen(resolved_output_path.c_str(), "w");
     if (!out_file) {
-        std::cerr << "[ERROR] Cannot open subset_5k_predicted_segments_xgb.txt for writing\n";
+        std::cerr << "[ERROR] Cannot open " << resolved_output_path << " for writing\n";
         fclose(seg_file);
-        return 1;
-    }
-
-    FILE* nn_out_file = fopen("subset_5k_predicted_segments_nn.txt", "w");
-    if (!nn_out_file) {
-        std::cerr << "[ERROR] Cannot open subset_5k_predicted_segments_nn.txt for writing\n";
-        fclose(seg_file);
-        fclose(out_file);
         return 1;
     }
 
@@ -2455,9 +2494,7 @@ int main(int argc, char** argv) {
     // Timing accumulators
     uint64_t total_extract_ns = 0;
     uint64_t total_predict_ns = 0;
-    uint64_t total_nn_predict_ns = 0;
     size_t positive_predictions = 0;
-    size_t nn_positive_predictions = 0;
 
     segments_read = 0;
     while (segments_read < total_segments) {
@@ -2495,32 +2532,21 @@ int main(int argc, char** argv) {
             }
         }
 
-        // Run XGBoost prediction
+        // Run prediction with selected model
         auto pred_start = std::chrono::high_resolution_clock::now();
-        std::vector<float> predictions = predictor.predictBatch(batch_features.data(), n_read, n_features);
+        std::vector<float> predictions = (filter_mode == 'X')
+            ? xgb_predictor->predictBatch(batch_features.data(), n_read, n_features)
+            : nn_predictor->predictBatch(batch_features.data(), n_read, n_features);
         auto pred_end = std::chrono::high_resolution_clock::now();
         total_predict_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(pred_end - pred_start).count();
 
-        // Run NN prediction on same normalized features
-        auto nn_pred_start = std::chrono::high_resolution_clock::now();
-        std::vector<float> nn_predictions = nn_predictor.predictBatch(batch_features.data(), n_read, n_features);
-        auto nn_pred_end = std::chrono::high_resolution_clock::now();
-        total_nn_predict_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(nn_pred_end - nn_pred_start).count();
-
-        // Write kept segments to separate output files for each model.
-        // Both models output P(false positive): < 0.5 → keep (true IBD), ≥ 0.5 → filter.
-        // Format-once optimization: format the output line once per segment, then
-        // conditionally append to each model's buffer. This avoids redundant snprintf
-        // calls which dominated runtime when formatting was done independently.
+        // Write kept segments: P(false positive) < 0.5 → keep (true IBD)
         std::string out_buffer;
         out_buffer.reserve(predictions.size() * 80);
-        std::string nn_out_buffer;
-        nn_out_buffer.reserve(nn_predictions.size() * 80);
         char line[256];
         for (size_t i = 0; i < predictions.size(); ++i) {
-            bool xgb_keep = predictions[i] < 0.5f;
-            bool nn_keep = nn_predictions[i] < 0.5f;
-            if (xgb_keep || nn_keep) {
+            if (predictions[i] < 0.5f) {
+                positive_predictions++;
                 const IBDSegment& seg = segment_batch[i];
                 int sample1 = seg.hap1 / 2;
                 int hap1 = (seg.hap1 % 2) + 1;
@@ -2531,18 +2557,10 @@ int main(int argc, char** argv) {
                 int len = snprintf(line, sizeof(line), "%s\t%d\t%s\t%d\t%s\t%d\t%d\t%.6f\n",
                         id1.c_str(), hap1, id2.c_str(), hap2,
                         chrom.c_str(), seg.start_bp, seg.end_bp, seg.length_cm);
-                if (xgb_keep) {
-                    positive_predictions++;
-                    out_buffer.append(line, len);
-                }
-                if (nn_keep) {
-                    nn_positive_predictions++;
-                    nn_out_buffer.append(line, len);
-                }
+                out_buffer.append(line, len);
             }
         }
         fwrite(out_buffer.data(), 1, out_buffer.size(), out_file);
-        fwrite(nn_out_buffer.data(), 1, nn_out_buffer.size(), nn_out_file);
 
         // Progress bar
         double progress = static_cast<double>(segments_read) / total_segments;
@@ -2561,39 +2579,31 @@ int main(int argc, char** argv) {
     }
     std::cout << "\n";
 
-    fclose(seg_file);
     fclose(out_file);
-    fclose(nn_out_file);
+    fclose(seg_file);
 
     auto augment_end = std::chrono::steady_clock::now();
     double wallclock_sec = std::chrono::duration<double>(augment_end - augment_start).count();
     double extract_sec = total_extract_ns / 1e9;
     double inference_sec = total_predict_ns / 1e9;
-    double nn_inference_sec = total_nn_predict_ns / 1e9;
 
     size_t segments_filtered = segments_read - positive_predictions;
     double kept_pct = 100.0 * positive_predictions / segments_read;
     double filter_pct = 100.0 * segments_filtered / segments_read;
 
-    size_t nn_segments_filtered = segments_read - nn_positive_predictions;
-    double nn_kept_pct = 100.0 * nn_positive_predictions / segments_read;
-    double nn_filter_pct = 100.0 * nn_segments_filtered / segments_read;
-
+    const char* mode_name = (filter_mode == 'X') ? "XGBoost" : "Neural Network";
     std::cout << "\n[Segment Augmentation Results]\n";
+    std::cout << "  model:               " << mode_name << "\n";
     std::cout << "  segments processed:  " << segments_read << "\n";
-    std::cout << "  --- XGBoost ---\n";
     std::cout << "  segments kept:       " << positive_predictions << " (" << kept_pct << "%)\n";
     std::cout << "  segments filtered:   " << segments_filtered << " (" << filter_pct << "%)\n";
-    std::cout << "  output file:         subset_5k_predicted_segments_xgb.txt\n";
-    std::cout << "  --- Neural Network ---\n";
-    std::cout << "  segments kept:       " << nn_positive_predictions << " (" << nn_kept_pct << "%)\n";
-    std::cout << "  segments filtered:   " << nn_segments_filtered << " (" << nn_filter_pct << "%)\n";
-    std::cout << "  output file:         subset_5k_predicted_segments_nn.txt\n";
+    std::cout << "  output file:         " << resolved_output_path << "\n";
     std::cout << "  --- Timing ---\n";
     std::cout << "  wall clock time:     " << wallclock_sec << " s\n";
     std::cout << "  global stats time:   " << stats_sec << " s\n";
     std::cout << "  feature extraction:  " << extract_sec << " s (" << (segments_read / extract_sec) << " seg/sec)\n";
-    std::cout << "  XGB inference:       " << inference_sec << " s (" << (segments_read / inference_sec) << " seg/sec)\n";
-    std::cout << "  NN inference:        " << nn_inference_sec << " s (" << (segments_read / nn_inference_sec) << " seg/sec)\n";
+    std::cout << "  inference:           " << inference_sec << " s (" << (segments_read / inference_sec) << " seg/sec)\n";
+
+    } // end filter_mode block
 
 }

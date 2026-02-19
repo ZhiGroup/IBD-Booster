@@ -26,6 +26,26 @@ make -j
 | `--ps-width=N` | P-smoother minimum block width | 20 |
 | `--ps-gap=N` | P-smoother gap size | 1 |
 | `--ps-rho=F` | P-smoother error rate threshold | 0.05 |
+| `--filter=MODE` | ML filtering mode: `none`, `X` (XGBoost), or `N` (Neural Net) | none |
+| `--model-path=PATH` | Path to model weights file | auto per mode |
+| `--output=PATH` | Output file path for filtered segments | `predicted_segments.txt` |
+
+## Segment Filtering
+
+IBD-Booster can optionally filter false-positive segments using a trained ML model. Use `--filter=X` for XGBoost or `--filter=N` for a Neural Network. Only one model runs at a time.
+
+```bash
+# XGBoost filtering (uses default model path)
+./IBD-Booster input.vcf.gz map.map --threads=8 --filter=X --output=filtered.txt
+
+# Neural Network filtering with custom model path
+./IBD-Booster input.vcf.gz map.map --threads=8 --filter=N --model-path=/path/to/nn_weights.bin
+
+# No filtering (default) — just IBD detection
+./IBD-Booster input.vcf.gz map.map --threads=8
+```
+
+When filtering is enabled, segments are scored by P(false positive). Segments with score < 0.5 are kept as true IBD and written to the output file.
 
 ## Output Format
 
