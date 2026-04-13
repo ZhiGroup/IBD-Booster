@@ -1,6 +1,15 @@
 # IBD-Booster
 Fast IBD segment detection from phased VCF files, integrating P-smoother error correction and seed-and-extend IBD calling following Browning et al. (hap-IBD), implemented in C++. IBD-Booster uses the positional Burrows-Wheeler transform (PBWT) algorithm for efficient IBD detection.
 
+## Repository Structure
+- `reproducibility/` – scripts and configurations for simulation, training, and evaluation workflows
+- `main.cpp` – main entry point containing the core pipeline logic
+- `src/` – implementation of PBWT, P-smoother, feature extraction, and ML-based segment refinement
+- `include/` – header files for core modules
+- `example/` – example VCF file and genetic map for testing
+- `CMakeLists.txt` – build configuration
+- `README.md` – project documentation
+
 ## Building
 
 ```bash
