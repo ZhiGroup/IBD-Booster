@@ -53,9 +53,9 @@ IBD segments are written to `segments2.tsv` in tab-separated format:
 
 | Column | Description |
 |--------|-------------|
-| 1 | Sample 1 index (0-based) |
+| 1 | Sample 1 ID |
 | 2 | Sample 1 haplotype (0 or 1) |
-| 3 | Sample 2 index (0-based) |
+| 3 | Sample 2 ID |
 | 4 | Sample 2 haplotype (0 or 1) |
 | 5 | Segment start position (bp) |
 | 6 | Segment end position (bp) |
