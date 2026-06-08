@@ -49,7 +49,7 @@ When filtering is enabled, segments are scored by P(false positive). Segments wi
 
 ## Output Format
 
-IBD segments are written to `segments2.tsv` in tab-separated format:
+IBD segments are written to `<input>.ibds.tsv.gz` in tab-separated format:
 
 | Column | Description |
 |--------|-------------|
