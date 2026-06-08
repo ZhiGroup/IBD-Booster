@@ -28,7 +28,7 @@ make -j
 | `--ps-rho=F` | P-smoother error rate threshold | 0.05 |
 | `--filter=MODE` | ML filtering mode: `none`, `X` (XGBoost), or `N` (Neural Net) | none |
 | `--model-path=PATH` | Path to model weights file | auto per mode |
-| `--output=PATH` | Output file path for filtered segments | `predicted_segments.txt` |
+| `--output=PATH` | Output file path for filtered segments | `<input>.ibds.tsv.gz` |
 
 ## Segment Filtering
 
