@@ -46,6 +46,8 @@
 #include <atomic>
 #include <array>
 #include <memory>
+#include <zlib.h>
+#include <htslib/bgzf.h>
 
 #ifdef __linux__
 #include <pthread.h>
@@ -54,6 +56,12 @@
 #elif defined(_WIN32)
 #include <windows.h>
 #endif
+
+static inline std::string bgzf_error_string(BGZF* fp, const char* where) {
+    int ec = fp ? fp->errcode : -999999;
+    return std::string(where) + " failed, errcode=" + std::to_string(ec);
+}
+
 
 // Simple parallel_for using std::thread (replaces OpenMP to avoid thread pool conflicts)
 // Main thread participates in work to use exactly nthreads total
@@ -257,25 +265,24 @@ inline int findTrueDmin(int hap1, int hap2, int dmin,
                 m -= 64;
                 continue;
             }
-            // Found mismatch - return position after it
             int highest_mismatch = 63 - __builtin_clzll(xor_word);
             return (m - 63) + highest_mismatch + 1;
         }
         break;
     }
 
-    // Bit-by-bit for remainder
     while (m >= 0) {
         int byte_idx = m >> 3;
         int bit_idx = m & 7;
-        if ((h1_ptr[byte_idx] ^ h2_ptr[byte_idx]) >> bit_idx & 1) {
-            return m + 1;  // Mismatch at m, so true_dmin is m+1
+        if (((h1_ptr[byte_idx] ^ h2_ptr[byte_idx]) >> bit_idx) & 1) {
+            return m + 1;
         }
         --m;
     }
 
     return 0;
 }
+
 
 /**
  * Collect IBD seeds at a single site using PBWT divergence array.
@@ -784,52 +791,82 @@ public:
     }
 };
 
-// Per-thread output buffer for both binary and TSV segments
+// Per-thread output buffer for both binary and BGZF-compressed TSV segments.
+// BGZF uses internal worker threads via bgzf_mt(), so compression is parallelized
+// inside HTSlib even though calls to bgzf_write() are serialized on one stream.
 class OutputBuffer {
 private:
-    static const size_t BUFFER_THRESHOLD = 8192;  // ~8K segments
+    static constexpr size_t BIN_BUFFER_THRESHOLD = 8192;
+    static constexpr size_t BGZF_BUFFER_FLUSH_BYTES = 4 * 1024 * 1024;  // 4 MB text chunks
+
     std::vector<BinarySegment> bin_buffer;
-    std::string tsv_buffer;
+    std::string bgzf_buffer;
     FILE* bin_file;
-    FILE* tsv_file;
-    std::mutex& file_mtx;
+    BGZF* bgzf_file;
+    std::mutex& bin_mtx;
+    std::mutex& bgzf_mtx;
     std::atomic<size_t>& segment_count;
     StripedDedup& dedup;
+    const HapMetadata& meta;
     size_t local_count = 0;
 
 public:
-    OutputBuffer(FILE* bin, FILE* tsv, std::mutex& mtx, std::atomic<size_t>& count, StripedDedup& dedup_ref)
-        : bin_file(bin), tsv_file(tsv), file_mtx(mtx), segment_count(count), dedup(dedup_ref) {
-        bin_buffer.reserve(BUFFER_THRESHOLD * 3 / 2);
-        tsv_buffer.reserve(BUFFER_THRESHOLD * 50);  // ~50 bytes per TSV line
+    OutputBuffer(FILE* bin, BGZF* bgzf,
+                 std::mutex& bin_mutex, std::mutex& bgzf_mutex,
+                 std::atomic<size_t>& count, StripedDedup& dedup_ref,
+                 const HapMetadata& meta_ref)
+        : bin_file(bin), bgzf_file(bgzf),
+          bin_mtx(bin_mutex), bgzf_mtx(bgzf_mutex),
+          segment_count(count), dedup(dedup_ref), meta(meta_ref) {
+        bin_buffer.reserve(BIN_BUFFER_THRESHOLD * 2);
+        bgzf_buffer.reserve(BGZF_BUFFER_FLUSH_BYTES + (1 << 20));
     }
 
-    // Write segment to both buffers
     void writeBinary(const BinarySegment& seg) {
         bin_buffer.push_back(seg);
 
-        // Also format TSV line
-        char line[128];
-        int len = snprintf(line, sizeof(line), "%d\t%d\t%d\t%d\t%d\t%d\t%.6f\n",
-                          seg.hap1 / 2, seg.hap1 & 1, seg.hap2 / 2, seg.hap2 & 1,
-                          seg.start_bp, seg.end_bp, static_cast<double>(seg.length_cm));
-        tsv_buffer.append(line, len);
+        const int sample1 = seg.hap1 / 2;
+        const int sample2 = seg.hap2 / 2;
+        const int hap1 = seg.hap1 & 1;
+        const int hap2 = seg.hap2 & 1;
+        const std::string& id1 = meta.sampleIDs[sample1];
+        const std::string& id2 = meta.sampleIDs[sample2];
 
-        local_count++;
+        char line[256];
+        int len = snprintf(line, sizeof(line), "%s\t%d\t%s\t%d\t%d\t%d\t%.6f\n",
+                           id1.c_str(), hap1,
+                           id2.c_str(), hap2,
+                           seg.start_bp, seg.end_bp,
+                           static_cast<double>(seg.length_cm));
+        bgzf_buffer.append(line, len);
 
-        if (bin_buffer.size() >= BUFFER_THRESHOLD) {
+        ++local_count;
+        if (bin_buffer.size() >= BIN_BUFFER_THRESHOLD ||
+            bgzf_buffer.size() >= BGZF_BUFFER_FLUSH_BYTES) {
             flush();
         }
     }
 
     void flush() {
-        if (!bin_buffer.empty()) {
-            std::lock_guard<std::mutex> lock(file_mtx);
-            fwrite(bin_buffer.data(), sizeof(BinarySegment), bin_buffer.size(), bin_file);
-            fwrite(tsv_buffer.data(), 1, tsv_buffer.size(), tsv_file);
+        if (bin_file && !bin_buffer.empty()) {
+            std::lock_guard<std::mutex> lock(bin_mtx);
+            size_t written = fwrite(bin_buffer.data(), sizeof(BinarySegment), bin_buffer.size(), bin_file);
+            if (written != bin_buffer.size()) {
+                throw std::runtime_error("fwrite failed for binary segment output");
+            }
             bin_buffer.clear();
-            tsv_buffer.clear();
         }
+
+        if (bgzf_file && !bgzf_buffer.empty()) {
+            std::lock_guard<std::mutex> lock(bgzf_mtx);
+            ssize_t written = bgzf_write(bgzf_file, bgzf_buffer.data(), bgzf_buffer.size());
+            if (written < 0 || static_cast<size_t>(written) != bgzf_buffer.size()) {
+                    throw std::runtime_error("bgzf_write failed with errcode=" + std::to_string(bgzf_file->errcode));
+
+            }
+            bgzf_buffer.clear();
+        }
+
         if (local_count > 0) {
             segment_count.fetch_add(local_count, std::memory_order_relaxed);
             local_count = 0;
@@ -1372,7 +1409,7 @@ inline int nextEndHapMajor(int hap1, int hap2, int end,
         __builtin_prefetch(h2_ptr + ((m + 512) >> 3), 0, 3);
     }
 
-#ifdef USE_AVX512
+#if USE_AVX512
     // AVX-512: 512-bit scanning (512 sites at a time) - 8x faster than 64-bit
     while (m + 512 <= LastMarker) {
         if ((m & 7) == 0) {  // m is byte-aligned
@@ -1408,7 +1445,7 @@ inline int nextEndHapMajor(int hap1, int hap2, int end,
         // Check alignment: we want bits [m, m+255] to be in 32 consecutive bytes
         if ((m & 7) == 0) {  // m is byte-aligned
             int word_start_byte = m >> 3;
-            __m256i v1 = _mm256_loadu_si256((const __m256i*)(h1_ptr + word_start_byte));
+          __m256i v1 = _mm256_loadu_si256((const __m256i*)(h1_ptr + word_start_byte));
             __m256i v2 = _mm256_loadu_si256((const __m256i*)(h2_ptr + word_start_byte));
             __m256i xor_result = _mm256_xor_si256(v1, v2);
 
@@ -1702,7 +1739,7 @@ void processSeedBatch(
         }
 
         if (nStart >= 0) {
-            // Extend forwards using fast 64-bit word scanning (replaces bit-by-bit loop)
+            // Extend forwardsing fast 64-bit word scanning (replaces bit-by-bit loop)
             int inclEnd = hap_major.extendMatchForward64(hap1, hap2, ext_end, LastMarker);
             int prevInclEnd = inclEnd;
             int nextInclEnd = nextEndHapMajor(hap1, hap2, prevInclEnd, genPos, meta, hap_major,
@@ -1730,7 +1767,7 @@ void processSeedBatch(
     }
 }
 
-// Timing counters (atomic for thread-safe accumulation)
+// Timing counters (atomic for threade accumulation)
 struct TimingStats {
     std::atomic<uint64_t> pbwt_ns{0};       // PBWT step time
     std::atomic<uint64_t> collect_ns{0};    // Seed collection time
@@ -1759,8 +1796,9 @@ void runWindowThread(
     std::atomic<int>& finished_count,
     int n_windows,
     FILE* bin_file,
-    FILE* tsv_file,
-    std::mutex& file_mtx,
+    BGZF* bgzf_file,
+    std::mutex& bin_mtx,
+    std::mutex& bgzf_mtx,
     std::atomic<size_t>& segment_count,
     StripedDedup& dedup,
     bool isLastWindow,
@@ -1770,7 +1808,7 @@ void runWindowThread(
     int n_haps = meta.n_haps;
 
     // Create per-thread output buffer (writes both binary and TSV)
-    OutputBuffer output_buffer(bin_file, tsv_file, file_mtx, segment_count, dedup);
+    OutputBuffer output_buffer(bin_file, bgzf_file, bin_mtx, bgzf_mtx, segment_count, dedup, meta);
 
     // Initialize PBWT state for this window
     PBWTState st(n_haps);
@@ -1927,7 +1965,7 @@ int main(int argc, char** argv) {
         std::cerr << "  --model-path=PATH Path to model weights file (default: auto per mode)\n";
         std::cerr << "  --output=PATH     Output file path for filtered segments\n";
         std::cerr << "\nOutput format (tab-separated):\n";
-        std::cerr << "  sample1_idx  hap1  sample2_idx  hap2  start_bp  end_bp  length_cM\n";
+        std::cerr << "  sample1_id  hap1  sample2_id  hap2  start_bp  end_bp  length_cM\n";
         return 1;
     }
 
@@ -1941,7 +1979,9 @@ int main(int argc, char** argv) {
     PSmootherParams ps_params;  // P-smoother parameters (defaults: L=20, W=20, G=1, rho=0.05)
     char filter_mode = ' ';    // ' ' = none, 'X' = XGBoost, 'N' = Neural Net
     std::string model_path;    // User-specified model path (empty = use default per mode)
-    std::string output_path;   // User-specified output path for filtered segments
+    std::string output_path;   // User-specified output path for final gzipped segments
+    bool keep_temp_binary = false;
+    bool use_temp_binary = true;
 
     for (int i = 3; i < argc; ++i) {
         std::string arg = argv[i];
@@ -1973,6 +2013,10 @@ int main(int argc, char** argv) {
             model_path = arg.substr(13);
         } else if (arg.find("--output=") == 0) {
             output_path = arg.substr(9);
+        } else if (arg == "--keep-temp-binary") {
+            keep_temp_binary = true;
+        } else if (arg == "--no-temp-binary") {
+            use_temp_binary = false;
         }
     }
     // Pass thread count to P-smoother for parallel processing
@@ -1983,12 +2027,32 @@ int main(int argc, char** argv) {
     int extract_threads = nthreads;
     int xgb_threads = nthreads;
 
+    if (output_path.empty()) {
+        output_path = vcf_path;
+        if (output_path.size() >= 7 && output_path.compare(output_path.size() - 7, 7, ".vcf.gz") == 0) {
+            output_path.erase(output_path.size() - 7);
+        } else if (output_path.size() >= 4 && output_path.compare(output_path.size() - 4, 4, ".vcf") == 0) {
+            output_path.erase(output_path.size() - 4);
+        }
+        output_path += ".ibds.tsv.gz";
+    } else if (output_path.size() < 3 || output_path.compare(output_path.size() - 3, 3, ".gz") != 0) {
+        output_path += ".gz";
+    }
+
+    std::string temp_bin_path = output_path;
+    if (temp_bin_path.size() >= 7 && temp_bin_path.compare(temp_bin_path.size() - 7, 7, ".tsv.gz") == 0) {
+        temp_bin_path.replace(temp_bin_path.size() - 7, 7, ".tmp.bin");
+    } else {
+        temp_bin_path += ".tmp.bin";
+    }
+
     std::cerr << "[INFO] Using " << nthreads << " thread(s)\n";
     std::cerr << "[INFO] min-output=" << min_output << " cM\n";
+    std::cerr << "[INFO] Output file: " << output_path << "\n";
     if (filter_mode == 'X') {
         std::cerr << "[INFO] Filter mode: XGBoost\n";
     } else if (filter_mode == 'N') {
-        std::cerr << "[INFO] Filter mode: Neural Network\n";
+        std::cerr<< "[INFO] Filter mode: Neural Network\n";
     } else {
         std::cerr << "[INFO] Filter mode: none (no ML filtering)\n";
     }
@@ -2036,41 +2100,6 @@ int main(int argc, char** argv) {
         auto ps_end = std::chrono::steady_clock::now();
         double ps_time = std::chrono::duration<double>(ps_end - ps_start).count();
 
-        // Check if file appears already smoothed (correction rate < 0.1%)
-        // P-smoother is not idempotent - running it on already-smoothed data produces spurious corrections
-        // due to PBWT block boundaries shifting after the first smoothing pass
-        double total_alleles = (double)meta.n_haps * meta.n_sites;
-        double correction_rate = (double)corrections / total_alleles;
-        const double ALREADY_SMOOTHED_THRESHOLD = 0.001;  // 0.1%
-
-        if (corrections > 0 && correction_rate < ALREADY_SMOOTHED_THRESHOLD) {
-            // Reload original data - file was already smoothed
-            std::cerr << "[INFO] File appears already smoothed (correction rate " << (correction_rate * 100) << "% < 0.1%), reloading original\n";
-            hap_2d.clear();
-            meta = read_vcf_to_2d(vcf_path, hap_2d);
-            corrections = 0;
-        }
-
-        // Write smoothed VCF only if meaningful corrections were made (async to overlap with IBD detection)
-        if (corrections > 0) {
-            // Generate output filename in current directory: /path/to/input.vcf.gz -> input_smooth.vcf.gz
-            std::string smoothed_vcf = vcf_path;
-            // Extract just the filename (remove directory path)
-            size_t last_slash = smoothed_vcf.find_last_of("/\\");
-            if (last_slash != std::string::npos) {
-                smoothed_vcf = smoothed_vcf.substr(last_slash + 1);
-            }
-            // Insert _smooth before .vcf extension
-            size_t ext_pos = smoothed_vcf.rfind(".vcf");
-            if (ext_pos != std::string::npos) {
-                smoothed_vcf.insert(ext_pos, "_smooth");
-            } else {
-                smoothed_vcf += "_smooth.vcf.gz";
-            }
-
-            // Write smoothed VCF synchronously (before freeing hap_2d)
-            write_smoothed_vcf(vcf_path, smoothed_vcf, hap_2d, meta, minMac);
-        }
     }
 
     // Recompute MAC (needed for minMac filter)
@@ -2104,19 +2133,42 @@ int main(int argc, char** argv) {
     int LastMarker = n_sites - 1;
 
     // Open output files (both binary for ML pipeline and TSV for human inspection)
-    FILE* bin_file = fopen("subset_5k_Segments.bin", "wb");
-    FILE* tsv_file = fopen("subset_5k_Segments.tsv", "w");
-    if (!bin_file || !tsv_file) {
-        std::cerr << "[ERROR] Cannot open output files for writing\n";
+FILE* bin_file = nullptr;
+BGZF* bgzf_file = nullptr;
+
+if (use_temp_binary) {
+    bin_file = fopen(temp_bin_path.c_str(), "wb");
+    if (!bin_file) {
+        std::cerr << "[ERROR] Cannot open temp binary output file for writing: "
+                  << temp_bin_path << "\n";
         return 1;
     }
+}
+
+bgzf_file = bgzf_open(output_path.c_str(), "w");
+if (!bgzf_file) {
+    std::cerr << "[ERROR] Cannot open BGZF output file for writing: "
+              << output_path << "\n";
+    if (bin_file) fclose(bin_file);
+    return 1;
+}
+
+// Enable parallel BGZF compression in HTSlib.
+if (bgzf_mt(bgzf_file, nthreads, 256) != 0) {
+    std::cerr << "[ERROR] bgzf_mt failed for output: " << output_path << "\n";
+    if (bin_file) fclose(bin_file);
+    bgzf_close(bgzf_file);
+    return 1;
+}
+
 
     // Shared resources for parallel execution
     const size_t QUEUE_CAPACITY = 16;
     SeedQueue seedQ(QUEUE_CAPACITY);
     std::atomic<int> finished_count(0);
     std::atomic<size_t> segment_count(0);
-    std::mutex file_mtx;
+    std::mutex bin_file_mtx;
+    std::mutex bgzf_file_mtx;
 
     auto pbwt_start = std::chrono::steady_clock::now();
 
@@ -2130,17 +2182,24 @@ int main(int argc, char** argv) {
         std::vector<Seed> seeds;
         seeds.reserve(SEED_LIST_THRESHOLD);
 
-        // Output buffers for single-threaded (both binary and TSV)
+        // Output buffers for single-threaded: optional temp binary and final gzipped TSV
         std::vector<BinarySegment> seg_buffer;
-        std::string tsv_buffer;
-        seg_buffer.reserve(8192);
-        tsv_buffer.reserve(8192 * 50);
+        std::string bgzf_buffer;
+        if (bin_file) seg_buffer.reserve(8192);
+        bgzf_buffer.reserve(4 * 1024 * 1024);
         auto flushSegBuffer = [&]() {
-            if (!seg_buffer.empty()) {
-                fwrite(seg_buffer.data(), sizeof(BinarySegment), seg_buffer.size(), bin_file);
-                fwrite(tsv_buffer.data(), 1, tsv_buffer.size(), tsv_file);
-                seg_buffer.clear();
-                tsv_buffer.clear();
+            if ((bin_file && !seg_buffer.empty()) || !bgzf_buffer.empty()) {
+                if (bin_file && !seg_buffer.empty()) {
+                    fwrite(seg_buffer.data(), sizeof(BinarySegment), seg_buffer.size(), bin_file);
+                    seg_buffer.clear();
+                }
+                if (!bgzf_buffer.empty()) {
+                    ssize_t written = bgzf_write(bgzf_file, bgzf_buffer.data(), bgzf_buffer.size());
+                    if (written < 0 || static_cast<size_t>(written) != bgzf_buffer.size()) {
+                        std::cerr << "[ERROR] bgzf_write failed, errcode=" << bgzf_file->errcode << "\n";
+                    }
+                    bgzf_buffer.clear();
+                }
             }
         };
 
@@ -2191,14 +2250,18 @@ int main(int argc, char** argv) {
                         seg.length_cm = static_cast<float>(length_cm);
                         seg_buffer.push_back(seg);
 
-                        // Also format TSV line
-                        char line[128];
-                        int len = snprintf(line, sizeof(line), "%d\t%d\t%d\t%d\t%d\t%d\t%.6f\n",
-                                          hap1 / 2, hap1 & 1, hap2 / 2, hap2 & 1,
+                                                // Also format TSV line using VCF sample IDs
+                        const int sample1 = hap1 / 2;
+                        const int sample2 = hap2 / 2;
+                        const std::string& id1 = meta.sampleIDs[sample1];
+                        const std::string& id2 = meta.sampleIDs[sample2];
+                        char line[256];
+                        int len = snprintf(line, sizeof(line), "%s\t%d\t%s\t%d\t%d\t%d\t%.6f\n",
+                                          id1.c_str(), hap1 & 1, id2.c_str(), hap2 & 1,
                                           seg.start_bp, seg.end_bp, length_cm);
-                        tsv_buffer.append(line, len);
+                        bgzf_buffer.append(line, len);
 
-                        segment_count++;
+segment_count++;
                         if (seg_buffer.size() >= 8192) {
                             flushSegBuffer();
                         }
@@ -2227,8 +2290,17 @@ int main(int argc, char** argv) {
 
         // Flush remaining segments
         flushSegBuffer();
-        fclose(bin_file);
-        fclose(tsv_file);
+        if (bin_file) {
+            fclose(bin_file);
+            bin_file = nullptr;
+        }
+        if (bgzf_close(bgzf_file) != 0) {
+            std::cerr << "[ERROR] Failed to finalize BGZF output: " << output_path << "\n";
+            return 1;
+        }
+        if (use_temp_binary && !keep_temp_binary && (filter_mode != 'X' && filter_mode != 'N')) {
+            std::remove(temp_bin_path.c_str());
+        }
 
         auto end_time = std::chrono::steady_clock::now();
         auto total_elapsed = std::chrono::duration_cast<std::chrono::seconds>(end_time - start_time).count();
@@ -2266,7 +2338,7 @@ int main(int argc, char** argv) {
                                std::cref(genPos),
                                MIN_SEED_CM, MIN_OUTPUT_CM, MAX_GAP, MIN_MARKERS, MIN_EXTEND, LastMarker,
                                std::ref(seedQ), std::ref(finished_count), actual_threads,
-                               bin_file, tsv_file, std::ref(file_mtx), std::ref(segment_count),
+                               bin_file, bgzf_file, std::ref(bin_file_mtx), std::ref(bgzf_file_mtx), std::ref(segment_count),
                                std::ref(dedup),
                                isLastWindow,
                                std::ref(timing));
@@ -2282,21 +2354,34 @@ int main(int argc, char** argv) {
             std::cref(genPos),
             MIN_SEED_CM, MIN_OUTPUT_CM, MAX_GAP, MIN_MARKERS, MIN_EXTEND, LastMarker,
             std::ref(seedQ), std::ref(finished_count), actual_threads,
-            bin_file, tsv_file, std::ref(file_mtx), std::ref(segment_count),
+            bin_file, bgzf_file, std::ref(bin_file_mtx), std::ref(bgzf_file_mtx), std::ref(segment_count),
             std::ref(dedup),
             true,  // isLastWindow
             std::ref(timing));
 
-        // Wait for worker threads to complete
+       // Wait for worker threads to complete
         for (auto& t : threads) {
             t.join();
         }
 
         seedQ.markFinished();
 
-        fclose(bin_file);
-        fclose(tsv_file);
+if (bgzf_file) {
+    if (bgzf_close(bgzf_file) != 0) {
+        std::cerr << "[ERROR] Failed to finalize BGZF output: "
+                  << output_path << "\n";
+        return 1;
+    }
+}
 
+if (bin_file) {
+    fclose(bin_file);
+    bin_file = nullptr;
+}
+
+if (use_temp_binary && !keep_temp_binary && (filter_mode != 'X' && filter_mode != 'N')) {
+    std::remove(temp_bin_path.c_str());
+}
         auto end_time = std::chrono::steady_clock::now();
         auto total_elapsed = std::chrono::duration_cast<std::chrono::seconds>(end_time - start_time).count();
 
@@ -2556,8 +2641,7 @@ int main(int argc, char** argv) {
                 const std::string& id2 = meta.sampleIDs[sample2];
                 int len = snprintf(line, sizeof(line), "%s\t%d\t%s\t%d\t%s\t%d\t%d\t%.6f\n",
                         id1.c_str(), hap1, id2.c_str(), hap2,
-                        chrom.c_str(), seg.start_bp, seg.end_bp, seg.length_cm);
-                out_buffer.append(line, len);
+                        chrom.c_str(), seg.start_bp, seg.end_bp, seg.length_cm);              out_buffer.append(line, len);
             }
         }
         fwrite(out_buffer.data(), 1, out_buffer.size(), out_file);
@@ -2607,3 +2691,5 @@ int main(int argc, char** argv) {
     } // end filter_mode block
 
 }
+
+
